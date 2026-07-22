@@ -1,0 +1,24 @@
+# Sensitive token/cookie files - never commit
+*.txt
+*.rar
+*.zip
+*.csv
+!requirements.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
