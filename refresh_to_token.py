@@ -1,8 +1,8 @@
 """
 Refresh Token → Minecraft Access Token
-Takes a Microsoft refresh token (from a .txt file) and runs it through the
-MSA refresh → XBL → XSTS → Minecraft chain to produce a fresh eyJra... JWT.
-Outputs to token.txt
+Takes one or more Microsoft refresh tokens (one per line in a .txt file) and
+runs each through the MSA refresh → XBL → XSTS → Minecraft chain. Successful
+Minecraft JWTs are written one per line to token.txt.
 """
 
 import os
@@ -30,26 +30,19 @@ DEFAULT_USER_AGENT = (
 
 # --- Helpers ---
 
-def find_refresh_files(directory: str) -> list[str]:
-    """Find .txt files that likely contain a refresh token (skip known ones)."""
-    skip = {"token.txt", "requirements.txt"}
-    return [
-        os.path.join(directory, f)
-        for f in os.listdir(directory)
-        if f.lower().endswith(".txt")
-        and f.lower() not in skip
-        and os.path.isfile(os.path.join(directory, f))
-    ]
-
-
-def read_refresh_token(filepath: str) -> str | None:
-    """Read the first non-empty line from a file as the refresh token."""
+def read_refresh_tokens(filepath: str) -> list[str]:
+    """Read every non-empty line from a file as a refresh token."""
     with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                return line
-    return None
+        return [line.strip() for line in f if line.strip()]
+
+
+def looks_like_netscape_cookie_file(lines: list[str]) -> bool:
+    """Recognise a browser-exported Netscape cookie file before processing it.
+
+    A cookie export contains tab-separated cookie columns. It is an input for
+    cookie_to_token.py, not a list of MSA refresh tokens.
+    """
+    return any("\t" in line for line in lines)
 
 
 # --- Step 1: Refresh MSA token ---
@@ -238,53 +231,64 @@ def main():
     cwd = os.getcwd()
     print(f"[*] Working directory: {cwd}")
 
-    # Find files that might contain a refresh token
-    txt_files = find_refresh_files(cwd)
-    if not txt_files:
-        print("[!] No .txt files found.")
-        print("    Place a .txt file with your refresh token in this directory.")
+    # Only refresh.txt is treated as input. This avoids accidentally reading
+    # browser-cookie exports or unrelated .txt files in the working folder.
+    refresh_path = os.path.join(cwd, "refresh.txt")
+    if not os.path.isfile(refresh_path):
+        print("[!] refresh.txt was not found.")
+        print("    Put one MSA refresh token per line in refresh.txt.")
         sys.exit(1)
 
-    print(f"[*] Found {len(txt_files)} candidate file(s):")
-    for f in txt_files:
-        print(f"    - {os.path.basename(f)}")
+    txt_files = [refresh_path]
+    print("[*] Input file: refresh.txt")
 
     all_tokens = []
     all_refresh = []
+    failed_refresh = []
+    processed_count = 0
 
     for filepath in txt_files:
-        refresh_token = read_refresh_token(filepath)
-        if not refresh_token:
-            print(f"\n[!] {os.path.basename(filepath)} is empty, skipping.")
-            continue
-        if "\t" in refresh_token:
-            print(f"\n[!] {os.path.basename(filepath)} looks like a Netscape cookie file, skipping.")
-            continue
-        if refresh_token.startswith("eyJra"):
-            print(f"\n[!] {os.path.basename(filepath)} already contains a Minecraft JWT, skipping.")
+        refresh_tokens = read_refresh_tokens(filepath)
+        filename = os.path.basename(filepath)
+        if not refresh_tokens:
+            print(f"\n[!] {filename} is empty, skipping.")
             continue
 
-        print(f"\n{'='*60}")
-        print(f"[*] Processing: {os.path.basename(filepath)}")
-        print(f"[*] Refresh token detected ({len(refresh_token)} chars)")
+        if looks_like_netscape_cookie_file(refresh_tokens):
+            print(f"\n[!] {filename} is a Netscape cookie file, not a refresh-token list.")
+            print("    Run cookie_to_token.py with it first, then put the resulting refresh token(s) in refresh.txt.")
+            continue
 
-        try:
-            result = asyncio.run(refresh_chain(refresh_token))
-        except Exception as e:
-            print(f"[-] Error: {type(e).__name__}: {e}")
-            import traceback
-            traceback.print_exc()
-            result = None
+        print(f"\n[*] {filename}: {len(refresh_tokens)} refresh token(s) found")
+        for token_index, refresh_token in enumerate(refresh_tokens, start=1):
+            if refresh_token.startswith("eyJra"):
+                print(f"\n[!] {filename} line {token_index} is already a Minecraft JWT, skipping.")
+                continue
 
-        if result:
-            token, new_refresh = result
-            print(f"\n[+] SUCCESS! Minecraft access_token (eyJra...):")
-            print(f"    {token[:80]}...{token[-30:]}")
-            all_tokens.append(token)
-            if new_refresh:
+            processed_count += 1
+            print(f"\n{'='*60}")
+            print(f"[*] Processing: {filename} (line {token_index}/{len(refresh_tokens)})")
+            print(f"[*] Refresh token detected ({len(refresh_token)} chars)")
+
+            try:
+                result = asyncio.run(refresh_chain(refresh_token))
+            except Exception as e:
+                print(f"[-] Error: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                result = None
+
+            if result:
+                token, new_refresh = result
+                print(f"\n[+] SUCCESS! Minecraft access_token (eyJra...):")
+                print(f"    {token[:80]}...{token[-30:]}")
+                all_tokens.append(token)
                 all_refresh.append(new_refresh)
-        else:
-            print("[-] Failed.")
+            else:
+                # Preserve a failed input token: a temporary API/network error
+                # should not silently remove it from the next refresh attempt.
+                failed_refresh.append(refresh_token)
+                print("[-] Failed; keeping the original refresh token for retry.")
 
     # Save MC access tokens
     output_path = os.path.join(cwd, "token.txt")
@@ -292,21 +296,24 @@ def main():
         with open(output_path, "w", encoding="utf-8") as f:
             for t in all_tokens:
                 f.write(t + "\n")
-        print(f"\n[OK] {len(all_tokens)} MC token(s) -> {output_path}")
+        print(f"\n[OK] {len(all_tokens)} MC token(s), one per line -> {output_path}")
     else:
         print(f"\n[XX] No tokens extracted.")
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("")
 
     # Save rotated refresh tokens
-    refresh_path = os.path.join(cwd, "refresh.txt")
-    if all_refresh:
+    refresh_output = all_refresh + failed_refresh
+    if refresh_output:
         with open(refresh_path, "w", encoding="utf-8") as f:
-            for r in all_refresh:
+            for r in refresh_output:
                 f.write(r + "\n")
-        print(f"[OK] {len(all_refresh)} refresh token(s) -> {refresh_path}")
+        print(
+            f"[OK] {len(all_refresh)} rotated refresh token(s) and "
+            f"{len(failed_refresh)} retryable token(s) -> {refresh_path}"
+        )
 
-    print("Done.")
+    print(f"Done. Processed {processed_count} refresh token(s).")
 
 
 if __name__ == "__main__":
