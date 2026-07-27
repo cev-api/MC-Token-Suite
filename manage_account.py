@@ -54,6 +54,15 @@ def read_lines(filepath: str) -> list[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+def parse_refresh_entry(line: str) -> tuple[str, str]:
+    """Return (optional username label, refresh token)."""
+    if ":" in line:
+        username, token = line.split(":", 1)
+        if username.strip() and token.strip():
+            return username.strip(), token.strip()
+    return "", line.strip()
+
+
 async def get_mc_token_from_refresh(refresh_token: str) -> str | None:
     """Turn a refresh token into a fresh MC token via full chain."""
     async with httpx.AsyncClient(timeout=30) as client:
@@ -150,10 +159,12 @@ async def resolve_token() -> str | None:
         print("[*] No token.txt found, trying refresh...")
 
     # Fallback to refresh.txt
-    refresh_tokens = read_lines(os.path.join(cwd, "refresh.txt"))
-    if refresh_tokens:
-        print(f"[*] Using refresh token from refresh.txt")
-        return await get_mc_token_from_refresh(refresh_tokens[0])
+    refresh_lines = read_lines(os.path.join(cwd, "refresh.txt"))
+    if refresh_lines:
+        username, refresh_token = parse_refresh_entry(refresh_lines[0])
+        label = f" for {username}" if username else ""
+        print(f"[*] Using refresh token{label} from refresh.txt")
+        return await get_mc_token_from_refresh(refresh_token)
 
     print("[!] No token.txt or refresh.txt found. Run cookie_to_token.py first.")
     return None

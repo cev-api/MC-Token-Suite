@@ -42,11 +42,14 @@ without needing the cookies again.
 python refresh_to_token.py
 ```
 
-- Reads `refresh.txt` with one refresh token per line
+- Reads `refresh.txt` with one refresh token per line, or `USERNAME:REFRESHTOKEN`
+  entries
 - Refreshes every line through MSA -> XBL -> XSTS -> Minecraft
+- Preserves username labels when rotated or failed tokens are written back
 - Outputs:
   - `token.txt` - fresh Minecraft access tokens, one per line
-  - `refresh.txt` - rotated refresh tokens, one per line (failed tokens are retained for retry)
+  - `rotated_refresh_YYYY-MM-DD_HH-MM-SS.txt` - newly rotated refresh tokens, one per line
+    (failed input tokens remain unchanged in `refresh.txt` for retry)
 
 ### 3. `validate_tokens.py`
 
@@ -63,6 +66,17 @@ python validate_tokens.py
 - Queries Minecraft profile API for account details
 - If the MC token is expired, auto-refreshes via `refresh.txt`
 - Also validates the refresh token is still alive
+- Resolves and displays the associated Minecraft name and UUID when possible
+- Writes successful validated/newly rotated entries to
+  `validated_refresh_YYYY-MM-DD_HH-MM-SS.txt`
+- Writes detailed access-token and refresh-token information to
+  `verbose_YYYY-MM-DD_HH-MM-SS.txt`
+  immediately in the same format as the input: `USERNAME:REFRESHTOKEN`
+- Uses proxies from `proxy.txt` in round-robin order during bulk checks. Proxy
+  lines may be `http://host:port`, `https://host:port`, `socks5://host:port`,
+  `socks5h://host:port`, or bare `host:port` (treated as HTTP).
+- Runs refresh-token checks concurrently with a bounded worker limit and keeps
+  report output in the same order as `refresh.txt`.
 
 ### 4. `manage_account.py`
 
@@ -123,13 +137,13 @@ browser-exported-cookies.txt
   cookie_to_token.py
         |
         +---> token.txt   (MC access tokens, one per line)
-        +---> refresh.txt (MSA refresh tokens, one per line)
+        +---> refresh.txt (MSA refresh tokens, one per line, optionally labeled)
                 |
                 v
         refresh_to_token.py  --> fresh token.txt + rotated refresh.txt
                 |
                 v
-        validate_tokens.py    --> account info, expiry, name history
+        validate_tokens.py    --> account info, expiry, names, validation report
         manage_account.py     --> name change, skin change, name check
         mc_account_checker.py --> username/account lookup
 ```

@@ -8,6 +8,7 @@ Minecraft JWTs are written one per line to token.txt.
 import os
 import sys
 import asyncio
+from datetime import datetime
 import httpx
 
 # --- Constants ---
@@ -30,10 +31,23 @@ DEFAULT_USER_AGENT = (
 
 # --- Helpers ---
 
-def read_refresh_tokens(filepath: str) -> list[str]:
-    """Read every non-empty line from a file as a refresh token."""
+def parse_refresh_entry(line: str) -> tuple[str, str]:
+    """Return (optional username label, refresh token)."""
+    if ":" in line:
+        username, token = line.split(":", 1)
+        if username.strip() and token.strip():
+            return username.strip(), token.strip()
+    return "", line.strip()
+
+
+def format_refresh_entry(username: str, refresh_token: str) -> str:
+    return f"{username}:{refresh_token}" if username else refresh_token
+
+
+def read_refresh_tokens(filepath: str) -> list[tuple[str, str]]:
+    """Read every non-empty line as (optional username, refresh token)."""
     with open(filepath, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip()]
+        return [parse_refresh_entry(line.strip()) for line in f if line.strip()]
 
 
 def looks_like_netscape_cookie_file(lines: list[str]) -> bool:
@@ -42,7 +56,7 @@ def looks_like_netscape_cookie_file(lines: list[str]) -> bool:
     A cookie export contains tab-separated cookie columns. It is an input for
     cookie_to_token.py, not a list of MSA refresh tokens.
     """
-    return any("\t" in line for line in lines)
+    return any("\t" in token for _, token in lines)
 
 
 # --- Step 1: Refresh MSA token ---
@@ -244,7 +258,6 @@ def main():
 
     all_tokens = []
     all_refresh = []
-    failed_refresh = []
     processed_count = 0
 
     for filepath in txt_files:
@@ -260,7 +273,7 @@ def main():
             continue
 
         print(f"\n[*] {filename}: {len(refresh_tokens)} refresh token(s) found")
-        for token_index, refresh_token in enumerate(refresh_tokens, start=1):
+        for token_index, (username, refresh_token) in enumerate(refresh_tokens, start=1):
             if refresh_token.startswith("eyJra"):
                 print(f"\n[!] {filename} line {token_index} is already a Minecraft JWT, skipping.")
                 continue
@@ -268,6 +281,8 @@ def main():
             processed_count += 1
             print(f"\n{'='*60}")
             print(f"[*] Processing: {filename} (line {token_index}/{len(refresh_tokens)})")
+            if username:
+                print(f"[*] Username label: {username}")
             print(f"[*] Refresh token detected ({len(refresh_token)} chars)")
 
             try:
@@ -283,11 +298,8 @@ def main():
                 print(f"\n[+] SUCCESS! Minecraft access_token (eyJra...):")
                 print(f"    {token[:80]}...{token[-30:]}")
                 all_tokens.append(token)
-                all_refresh.append(new_refresh)
+                all_refresh.append(format_refresh_entry(username, new_refresh))
             else:
-                # Preserve a failed input token: a temporary API/network error
-                # should not silently remove it from the next refresh attempt.
-                failed_refresh.append(refresh_token)
                 print("[-] Failed; keeping the original refresh token for retry.")
 
     # Save MC access tokens
@@ -302,16 +314,14 @@ def main():
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("")
 
-    # Save rotated refresh tokens
-    refresh_output = all_refresh + failed_refresh
-    if refresh_output:
-        with open(refresh_path, "w", encoding="utf-8") as f:
-            for r in refresh_output:
-                f.write(r + "\n")
-        print(
-            f"[OK] {len(all_refresh)} rotated refresh token(s) and "
-            f"{len(failed_refresh)} retryable token(s) -> {refresh_path}"
-        )
+    # Save rotated refresh tokens separately. Keep refresh.txt unchanged as
+    # the input/source file; failed entries remain there for a later retry.
+    run_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    rotated_path = os.path.join(cwd, f"rotated_refresh_{run_stamp}.txt")
+    with open(rotated_path, "w", encoding="utf-8") as f:
+        for r in all_refresh:
+            f.write(r + "\n")
+    print(f"[OK] {len(all_refresh)} rotated refresh token(s) -> {rotated_path}")
 
     print(f"Done. Processed {processed_count} refresh token(s).")
 

@@ -72,26 +72,26 @@ def jwt_expiry(payload: dict) -> str:
 
 # --- Minecraft API queries ---
 
-async def query_mc_api(token: str, url: str) -> dict | None:
+async def query_mc_api(token: str, url: str, proxy: str | None = None) -> dict | None:
     """Generic GET to a Mojang authed endpoint."""
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, proxy=proxy) as client:
         resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code == 200:
             return resp.json()
         return None
 
 
-async def get_profile(token: str) -> dict | None:
+async def get_profile(token: str, proxy: str | None = None) -> dict | None:
     """Minecraft profile (username, UUID, skins, capes)."""
-    return await query_mc_api(token, MC_PROFILE_URL)
+    return await query_mc_api(token, MC_PROFILE_URL, proxy)
 
 
-async def get_name_change_info(token: str) -> dict | None:
+async def get_name_change_info(token: str, proxy: str | None = None) -> dict | None:
     """Name change eligibility & history."""
-    return await query_mc_api(token, MC_NAME_CHANGE_URL)
+    return await query_mc_api(token, MC_NAME_CHANGE_URL, proxy)
 
 
-async def get_name_history(uuid: str) -> list | None:
+async def get_name_history(uuid: str, proxy: str | None = None) -> list | None:
     """Public endpoint: full name history for a UUID (no auth needed).
     Tries the new Minecraft API first, falls back to legacy api.mojang.com."""
     clean_uuid = uuid.replace("-", "")
@@ -100,7 +100,7 @@ async def get_name_history(uuid: str) -> list | None:
         f"https://api.minecraftservices.com/minecraft/profile/lookup/name/{clean_uuid}/names",
         f"https://api.mojang.com/user/profiles/{clean_uuid}/names",
     ]
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, proxy=proxy) as client:
         for url in urls:
             try:
                 resp = await client.get(url)
@@ -139,10 +139,10 @@ def plural(n: int, word: str) -> str:
 
 # --- Quick refresh to get a valid MC token for profile queries ---
 
-async def refresh_mc_token(refresh_token: str) -> str | None:
+async def refresh_mc_token(refresh_token: str, proxy: str | None = None) -> str | None:
     """Refresh MSA -> XBL -> XSTS -> MC, return fresh MC token or None."""
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
             # 1. Refresh MSA
             resp = await client.post(
                 LIVE_CONNECT_TOKEN_URL,
@@ -206,8 +206,8 @@ async def refresh_mc_token(refresh_token: str) -> str | None:
 
 # --- Refresh token validation ---
 
-async def validate_refresh_token(refresh_token: str) -> dict | None:
-    async with httpx.AsyncClient(timeout=15) as client:
+async def validate_refresh_token(refresh_token: str, proxy: str | None = None) -> dict | None:
+    async with httpx.AsyncClient(timeout=15, proxy=proxy) as client:
         resp = await client.post(
             LIVE_CONNECT_TOKEN_URL,
             data={
@@ -233,6 +233,29 @@ async def validate_refresh_token(refresh_token: str) -> dict | None:
         return {"valid": False, "status": resp.status_code, "body": resp.text[:200]}
 
 
+def parse_refresh_entry(line: str) -> tuple[str, str]:
+    """Return (optional USERNAME label, refresh token)."""
+    if ":" in line:
+        username, token = line.split(":", 1)
+        if username.strip() and token.strip():
+            return username.strip(), token.strip()
+    return "", line.strip()
+
+
+def format_refresh_entry(username: str, refresh_token: str) -> str:
+    return f"{username}:{refresh_token}" if username else refresh_token
+
+
+def output_refresh_entry(result: dict) -> str:
+    """Format a successful refresh result with the best available username."""
+    label = result["username_label"] or result["profile_name"]
+    if result["new_refresh_entry"]:
+        token = result["new_refresh_entry"].split(":", 1)[-1]
+    else:
+        token = result["refresh_token"]
+    return format_refresh_entry(label, token)
+
+
 def read_lines(filepath: str) -> list[str]:
     if not os.path.isfile(filepath):
         return []
@@ -240,11 +263,232 @@ def read_lines(filepath: str) -> list[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+def read_proxies(filepath: str) -> list[str]:
+    """Read proxy URLs, ignoring blank lines and comments.
+
+    Accepted: http://host:port, https://host:port, socks5://host:port,
+    socks5h://host:port, bare host:port, and host:port:username:password
+    (the last two are treated as HTTP).
+    """
+    from urllib.parse import quote
+    proxies = []
+    for line in read_lines(filepath):
+        if line.startswith("#"):
+            continue
+        if "://" not in line:
+            fields = line.split(":")
+            if len(fields) == 4 and fields[1].isdigit():
+                host, port, username, password = fields
+                proxy = (
+                    f"http://{quote(username, safe='')}:{quote(password, safe='')}"
+                    f"@{host}:{port}"
+                )
+            else:
+                proxy = f"http://{line}"
+        else:
+            proxy = line
+        if proxy.startswith(("http://", "https://", "socks5://", "socks5h://")):
+            proxies.append(proxy)
+    return proxies
+
+
+def proxy_label(proxy: str) -> str:
+    """Display a proxy endpoint without exposing credentials."""
+    from urllib.parse import urlsplit
+    try:
+        parsed = urlsplit(proxy)
+        return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+    except Exception:
+        return "configured proxy"
+
+
+async def validate_refresh_entry(
+    username_label: str,
+    refresh_token: str,
+    proxy: str | None,
+) -> dict:
+    """Validate one refresh entry and resolve its Minecraft profile."""
+    validated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    result = {
+        "username_label": username_label,
+        "refresh_token": refresh_token,
+        "proxy": proxy,
+        "validated_at": validated_at,
+        "status": "UNKNOWN",
+        "profile_name": "",
+        "profile_uuid": "",
+        "new_refresh_entry": "",
+        "result": None,
+        "profile_error": "",
+    }
+
+    if refresh_token.startswith("eyJ"):
+        result["status"] = "JWT_NOT_TESTED"
+        return result
+
+    try:
+        validation = await validate_refresh_token(refresh_token, proxy)
+        result["result"] = validation
+        if not validation or not validation.get("valid"):
+            result["status"] = "DEAD"
+            return result
+
+        result["status"] = "VALID"
+        new_refresh = validation.get("new_refresh")
+        if new_refresh:
+            result["new_refresh_entry"] = format_refresh_entry(username_label, new_refresh)
+
+        profile_token = await refresh_mc_token(new_refresh or refresh_token, proxy)
+        if not profile_token:
+            result["profile_error"] = "Minecraft exchange failed"
+            return result
+
+        profile = await get_profile(profile_token, proxy)
+        if profile:
+            result["profile_name"] = profile.get("name", "")
+            result["profile_uuid"] = profile.get("id", "")
+        else:
+            result["profile_error"] = "profile lookup failed"
+    except Exception as exc:
+        result["status"] = "ERROR"
+        result["profile_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+async def validate_mc_entry(
+    index: int,
+    token: str,
+    fallback_refresh_token: str | None,
+    proxy: str | None,
+) -> dict:
+    """Validate one Minecraft access token and collect detailed account data."""
+    result = {
+        "index": index,
+        "token": token,
+        "proxy": proxy,
+        "payload": decode_jwt(token),
+        "profile": None,
+        "probe_token": token,
+        "token_status": "VALID",
+        "refresh_attempted": False,
+        "name_change": None,
+        "name_history": None,
+        "error": "",
+    }
+    try:
+        profile = await get_profile(token, proxy)
+        if not profile and fallback_refresh_token:
+            result["refresh_attempted"] = True
+            probe_token = await refresh_mc_token(fallback_refresh_token, proxy)
+            if probe_token:
+                result["probe_token"] = probe_token
+                profile = await get_profile(probe_token, proxy)
+                result["token_status"] = "REFRESHED" if profile else "INVALID"
+            else:
+                result["token_status"] = "INVALID"
+        elif not profile:
+            result["token_status"] = "INVALID"
+
+        result["profile"] = profile
+        if profile:
+            probe_token = result["probe_token"]
+            result["name_change"] = await get_name_change_info(probe_token, proxy)
+            uuid_ = profile.get("id", "")
+            name_history = (
+                result["name_change"].get("history")
+                or result["name_change"].get("nameChanges")
+                if result["name_change"]
+                else None
+            )
+            if not name_history and uuid_:
+                name_history = await get_name_history(uuid_, proxy)
+            result["name_history"] = name_history
+    except Exception as exc:
+        result["token_status"] = "ERROR"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def format_mc_result(result: dict) -> list[str]:
+    """Format detailed Minecraft-token output for screen and verbose log."""
+    token = result["token"]
+    lines = [
+        "\n" + "─" * 64,
+        f"  [{result['index']}] Token ({len(token)} chars)",
+        f"      Prefix: {token[:55]}...",
+    ]
+    payload = result["payload"]
+    if payload:
+        lines.append("      JWT claims:")
+        lines.extend(jwt_expiry(payload).splitlines())
+        for key in ("sub", "xuid", "iss"):
+            if payload.get(key):
+                lines.append(f"      {key}: {payload[key]}")
+    else:
+        lines.append("      (not a decodable JWT)")
+
+    profile = result["profile"]
+    if not profile:
+        lines.append("  >>> Could not fetch account info (token dead or refresh failed)")
+        if result["error"]:
+            lines.append(f"      Error: {result['error']}")
+        return lines
+
+    name = profile.get("name", "?")
+    uuid_ = profile.get("id", "?")
+    skins = profile.get("skins", [])
+    capes = profile.get("capes", [])
+    lines.extend([
+        f"\n  ---- Account: {name} ----",
+        f"  UUID:         {uuid_}",
+        f"  Skins:        {len(skins)} ({', '.join(s.get('variant', '?').upper() for s in skins) or 'none'})",
+        f"  Capes:        {len(capes)} ({', '.join(c.get('alias', '?') for c in capes) or 'none'})",
+    ])
+    for skin in skins:
+        if skin.get("state") == "ACTIVE":
+            lines.append(
+                f"  Active skin:  {skin.get('variant', 'CLASSIC').upper()} "
+                f"({skin.get('id', '?')[:16]}...)"
+            )
+
+    nc = result["name_change"]
+    if nc:
+        changeable = nc.get("nameChangeAllowed", nc.get("changeable"))
+        if changeable is not None:
+            lines.append(f"  Name change:  {'YES' if changeable else 'NO (cooldown)'}")
+        changed_at = nc.get("changedAt") or nc.get("lastChangedAt")
+        if changed_at:
+            lines.append(f"  Last changed: {fmt_iso(changed_at)}")
+        created_at = nc.get("createdAt")
+        if created_at:
+            lines.append(f"  Account age:  {fmt_iso(created_at)}")
+
+    history = result["name_history"]
+    if history:
+        lines.append(f"  Name history: {len(history)} name(s)")
+        for entry in history:
+            changed = entry.get("changedToAt")
+            lines.append(
+                f"    * {entry.get('name', '?')} "
+                f"({'since ' + fmt_iso(changed) if changed else 'original'})"
+            )
+    elif history is not None:
+        lines.append("  Name history: 1 name (no past changes)")
+    else:
+        lines.append("  Name history: unavailable")
+    return lines
+
+
 # --- Main ---
 
 async def main():
     cwd = os.getcwd()
     print(f"Working dir: {cwd}\n")
+    proxies = read_proxies(os.path.join(cwd, "proxy.txt"))
+    if proxies:
+        print(f"[*] Loaded {len(proxies)} proxy/proxies from proxy.txt (round-robin)\n")
+    else:
+        print("[*] No proxy.txt found or no usable proxies; using direct connections.\n")
 
     # ====================================================================
     #  token.txt - Minecraft access tokens
@@ -254,125 +498,162 @@ async def main():
     print(f"  token.txt  -  {len(mc_tokens)} Minecraft access token(s)")
     print(f"{'='*64}")
 
+    run_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    verbose_output = os.path.join(cwd, f"verbose_{run_stamp}.txt")
+    verbose_file = open(verbose_output, "w", encoding="utf-8")
+
     if not mc_tokens:
         print("  (no tokens found)\n")
     else:
-        for i, token in enumerate(mc_tokens, 1):
-            print(f"\n{'─'*64}")
-            print(f"  [{i}] Token ({len(token)} chars)")
-            print(f"      Prefix: {token[:55]}...")
+        fallback_refresh = parse_refresh_entry(read_lines(os.path.join(cwd, "refresh.txt"))[0])[1] \
+            if read_lines(os.path.join(cwd, "refresh.txt")) else None
+        token_concurrency = max(1, min(len(mc_tokens), len(proxies) or 5))
+        token_semaphore = asyncio.Semaphore(token_concurrency)
 
-            # -- Decode JWT --
-            payload = decode_jwt(token)
-            if payload:
-                print(f"      JWT claims:")
-                print(jwt_expiry(payload))
-                for key in ("sub", "xuid", "iss"):
-                    val = payload.get(key)
-                    if val:
-                        print(f"      {key}: {val}")
-            else:
-                print(f"      (not a decodable JWT)")
+        async def limited_mc(index, token, proxy):
+            async with token_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        validate_mc_entry(index, token, fallback_refresh, proxy),
+                        timeout=45,
+                    )
+                except asyncio.TimeoutError:
+                    return {
+                        "index": index,
+                        "token": token,
+                        "proxy": proxy,
+                        "payload": decode_jwt(token),
+                        "profile": None,
+                        "probe_token": token,
+                        "token_status": "TIMEOUT",
+                        "refresh_attempted": False,
+                        "name_change": None,
+                        "name_history": None,
+                        "error": "45-second account timeout",
+                    }
 
-            # -- Profile -- try MC token first; if expired, refresh via refresh.txt
-            profile = await get_profile(token)
-            probe_token = token
-            token_status = "VALID"
-
-            if not profile:
-                # Token expired - try to get a fresh one via refresh token
-                print(f"      (token expired, trying refresh...)", end=" ", flush=True)
-                refresh_tokens_early = read_lines(os.path.join(cwd, "refresh.txt"))
-                if refresh_tokens_early:
-                    probe_token = await refresh_mc_token(refresh_tokens_early[0])
-                    if probe_token:
-                        print("OK")
-                        profile = await get_profile(probe_token)
-                        token_status = "REFRESHED"
-                    else:
-                        print("FAILED")
-                else:
-                    print("no refresh.txt")
-
-            if not profile:
-                print(f"  >>> Could not fetch account info (token dead, no valid refresh)")
-                continue
-
-            name = profile.get("name", "?")
-            uuid_ = profile.get("id", "?")
-            skins = profile.get("skins", [])
-            capes = profile.get("capes", [])
-
-            print(f"\n  ---- Account: {name} ----")
-            print(f"  UUID:         {uuid_}")
-            print(f"  Skins:        {len(skins)} ({', '.join(s['variant'].upper() for s in skins) or 'none'})")
-            print(f"  Capes:        {len(capes)} ({', '.join(c['alias'] for c in capes) or 'none'})")
-
-            # Show active skin info
-            for s in skins:
-                if s.get("state") == "ACTIVE":
-                    print(f"  Active skin:  {s['variant'].upper() if s.get('variant') else 'CLASSIC'} ({s.get('id', '?')[:16]}...)")
-
-            # -- Name change info --
-            nc = await get_name_change_info(probe_token)
-            if nc:
-                changeable = nc.get("nameChangeAllowed", nc.get("changeable", None))
-                if changeable is not None:
-                    status = "YES" if changeable else "NO (cooldown)"
-                    print(f"  Name change:  {status}")
-                changed_at = nc.get("changedAt") or nc.get("lastChangedAt")
-                if changed_at:
-                    ago = ""
-                    try:
-                        dt = datetime.fromisoformat(changed_at.replace("Z", "+00:00"))
-                        delta = datetime.now(timezone.utc) - dt
-                        ago = f" ({delta.days}d ago)"
-                    except Exception:
-                        pass
-                    print(f"  Last changed: {fmt_iso(changed_at)}{ago}")
-                created_at = nc.get("createdAt")
-                if created_at:
-                    ago = ""
-                    try:
-                        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                        delta = datetime.now(timezone.utc) - dt
-                        ago = f" ({delta.days}d ago)"
-                    except Exception:
-                        pass
-                    print(f"  Account age:  {fmt_iso(created_at)}{ago}")
-
-            # -- Name history --
-            name_history = nc.get("history") or nc.get("nameChanges") if nc else None
-            if not name_history:
-                name_history = await get_name_history(uuid_) if uuid_ and uuid_ != "?" else None
-            if name_history:
-                print(f"  Name history: {len(name_history)} name(s)")
-                for entry in name_history:
-                    n = entry.get("name", "?")
-                    ts = entry.get("changedToAt")
-                    if ts:
-                        print(f"    * {n}  (since {fmt_iso(ts)})")
-                    else:
-                        print(f"    * {n}  (original)")
-            elif name_history is not None:
-                print(f"  Name history: 1 name (no past changes)")
-            else:
-                print(f"  Name history: unavailable")
+        token_tasks = [
+            asyncio.create_task(
+                limited_mc(i, token, proxies[i % len(proxies)] if proxies else None)
+            )
+            for i, token in enumerate(mc_tokens, 1)
+        ]
+        print(f"[*] Starting {len(token_tasks)} access-token checks with {token_concurrency} concurrent worker(s)...")
+        for task in asyncio.as_completed(token_tasks):
+            result = await task
+            lines = format_mc_result(result)
+            for line in lines:
+                print(line)
+                verbose_file.write(line + "\n")
+            verbose_file.flush()
+        print(f"[*] Completed {len(token_tasks)} access-token checks")
 
     # ====================================================================
     #  refresh.txt - MSA refresh tokens
     # ====================================================================
-    refresh_tokens = read_lines(os.path.join(cwd, "refresh.txt"))
+    refresh_entries = [parse_refresh_entry(line) for line in read_lines(os.path.join(cwd, "refresh.txt"))]
     print(f"\n{'='*64}")
-    print(f"  refresh.txt  -  {len(refresh_tokens)} MSA refresh token(s)")
+    print(f"  refresh.txt  -  {len(refresh_entries)} MSA refresh token(s)")
     print(f"{'='*64}")
 
-    if not refresh_tokens:
+    validation_output = os.path.join(cwd, f"validated_refresh_{run_stamp}.txt")
+    validation_file = open(validation_output, "w", encoding="utf-8")
+
+    if not refresh_entries:
         print("  (no refresh tokens found)\n")
     else:
-        for i, rt in enumerate(refresh_tokens, 1):
+        concurrency = max(1, min(len(refresh_entries), len(proxies) or 5))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def limited_validate(index, entry, proxy):
+            async with semaphore:
+                try:
+                    result = await asyncio.wait_for(
+                        validate_refresh_entry(entry[0], entry[1], proxy),
+                        timeout=30,
+                    )
+                except asyncio.TimeoutError:
+                    result = {
+                        "username_label": entry[0],
+                        "refresh_token": entry[1],
+                        "proxy": proxy,
+                        "validated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "status": "TIMEOUT",
+                        "profile_name": "",
+                        "profile_uuid": "",
+                        "new_refresh_entry": "",
+                        "result": {"status": "timeout", "body": "30-second account timeout"},
+                        "profile_error": "30-second account timeout",
+                    }
+                result["index"] = index
+                return result
+
+        tasks = [
+            asyncio.create_task(
+                limited_validate(i, entry, proxies[i % len(proxies)] if proxies else None)
+            )
+            for i, entry in enumerate(refresh_entries)
+        ]
+        results = [None] * len(tasks)
+        completed = 0
+        print(f"[*] Starting {len(tasks)} refresh checks with {concurrency} concurrent worker(s)...")
+        for completed_task in asyncio.as_completed(tasks):
+            result = await completed_task
+            results[result["index"]] = result
+            completed += 1
+            account_label = (
+                result["profile_name"]
+                or result["username_label"]
+                or f"line {result['index'] + 1}"
+            )
+            print(f"[*] Progress: {completed}/{len(tasks)} completed ({account_label}: {result['status']})")
+            if result["status"] == "VALID":
+                output_entry = output_refresh_entry(result)
+                validation_file.write(output_entry + "\n")
+                validation_file.flush()
+                print(f"[*] Saved validated token for {account_label}")
+        print(f"[*] Completed {len(results)} refresh checks")
+
+        timed_out = [result for result in results if result["status"] == "TIMEOUT"]
+        if timed_out:
+            print(f"[*] Retrying {len(timed_out)} timed-out account(s)...")
+            retry_tasks = [
+                asyncio.create_task(
+                    limited_validate(
+                        result["index"],
+                        refresh_entries[result["index"]],
+                        proxies[(result["index"] + 1) % len(proxies)] if proxies else None,
+                    )
+                )
+                for result in timed_out
+            ]
+            retry_completed = 0
+            for retry_task in asyncio.as_completed(retry_tasks):
+                result = await retry_task
+                results[result["index"]] = result
+                retry_completed += 1
+                account_label = (
+                    result["profile_name"]
+                    or result["username_label"]
+                    or f"line {result['index'] + 1}"
+                )
+                print(f"[*] Retry progress: {retry_completed}/{len(retry_tasks)} ({account_label}: {result['status']})")
+                if result["status"] == "VALID":
+                    output_entry = output_refresh_entry(result)
+                    validation_file.write(output_entry + "\n")
+                    validation_file.flush()
+                    print(f"[*] Saved validated token for {account_label}")
+
+        for i, result in enumerate(results, 1):
+            username_label = result["username_label"]
+            rt = result["refresh_token"]
+            validation = result["result"] or {}
             print(f"\n{'─'*64}")
             print(f"  [{i}] Refresh token ({len(rt)} chars)")
+            if username_label:
+                print(f"      Username label: {username_label}")
+            if result["proxy"]:
+                print(f"      Proxy: {proxy_label(result['proxy'])}")
             print(f"      Prefix: {rt[:50]}...")
 
             if rt.startswith("eyJ"):
@@ -381,22 +662,58 @@ async def main():
                     print(f"      JWT claims:")
                     print(jwt_expiry(payload))
             else:
-                print(f"      (opaque token - test-refreshing...)", end=" ", flush=True)
-                result = await validate_refresh_token(rt)
-                if result.get("valid"):
+                if validation.get("valid"):
                     print("OK")
-                    if result.get("expires_in"):
-                        print(f"      MSA token TTL: {result['expires_in']}s ({int(result['expires_in'])/3600:.1f}h)")
-                    if result.get("user_id"):
-                        print(f"      MSA user_id:   {result['user_id']}")
-                    if result.get("new_refresh"):
-                        print(f"      Rotated:       new refresh token issued ({len(result['new_refresh'])} chars)")
+                    if validation.get("expires_in"):
+                        print(f"      MSA token TTL: {validation['expires_in']}s ({int(validation['expires_in'])/3600:.1f}h)")
+                    if validation.get("user_id"):
+                        print(f"      MSA user_id:   {validation['user_id']}")
+                    if validation.get("new_refresh"):
+                        print(f"      Rotated:       new refresh token issued ({len(validation['new_refresh'])} chars)")
+                    if result["profile_name"]:
+                        print(f"      Minecraft name: {result['profile_name']}")
+                        print(f"      Minecraft UUID:  {result['profile_uuid']}")
+                    else:
+                        print(f"      Minecraft name: unavailable ({result['profile_error']})")
                 else:
-                    status = result.get("status", "?")
-                    body = result.get("body", "")
-                    print(f"DEAD (HTTP {status})")
+                    status_code = validation.get("status", "?")
+                    print(f"DEAD (HTTP {status_code})" if status_code != "?" else "ERROR")
+                    body = validation.get("body", "")
                     if body:
                         print(f"      Response: {body[:200]}")
+
+        verbose_file.write("\n" + "=" * 64 + "\nRefresh-token validation details\n" + "=" * 64 + "\n")
+        for result in results:
+            validation = result["result"] or {}
+            verbose_file.write(
+                f"[{result['index'] + 1}] "
+                f"{result['username_label'] or result['profile_name'] or '(no username label)'}\n"
+                f"Status: {result['status']}\n"
+                f"Token prefix: {result['refresh_token'][:50]}...\n"
+                f"Proxy: {proxy_label(result['proxy']) if result['proxy'] else 'direct'}\n"
+                f"Minecraft name: {result['profile_name'] or '(unknown)'}\n"
+                f"Minecraft UUID: {result['profile_uuid'] or '(unknown)'}\n"
+                f"MSA user ID: {validation.get('user_id', '(unknown)')}\n"
+                f"Expires in: {validation.get('expires_in', '(unknown)')}\n"
+                f"Saved refresh entry: {output_refresh_entry(result) if result['status'] == 'VALID' else '(none)'}\n\n"
+            )
+        verbose_file.flush()
+
+        counts = {}
+        for result in results:
+            status = result["status"]
+            counts[status] = counts.get(status, 0) + 1
+        summary = " | ".join(
+            f"{status}: {counts[status]}"
+            for status in ("VALID", "DEAD", "TIMEOUT", "ERROR", "JWT_NOT_TESTED")
+            if counts.get(status)
+        )
+        print(f"\nValidation summary: {summary or 'no refresh entries processed'}")
+
+    validation_file.close()
+    verbose_file.close()
+    print(f"\n[OK] Validation results -> {validation_output}")
+    print(f"[OK] Detailed output -> {verbose_output}")
 
     print(f"\n{'='*64}")
     print("  Done.")
