@@ -10,6 +10,7 @@ import sys
 import asyncio
 from datetime import datetime
 import httpx
+from proxy_utils import ProxyPool, choose_proxies
 
 # --- Constants ---
 
@@ -61,10 +62,10 @@ def looks_like_netscape_cookie_file(lines: list[str]) -> bool:
 
 # --- Step 1: Refresh MSA token ---
 
-async def refresh_msa_token(refresh_token: str) -> tuple[str, str] | None:
+async def refresh_msa_token(refresh_token: str, proxy: str | None = None) -> tuple[str, str] | None:
     """Exchange a refresh token for a fresh MSA access_token.
     Returns (access_token, new_refresh_token) or None."""
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
         print("[1/4] Refreshing MSA token...")
         resp = await client.post(
             LIVE_CONNECT_TOKEN_URL,
@@ -101,7 +102,7 @@ async def refresh_msa_token(refresh_token: str) -> tuple[str, str] | None:
 
 # --- Step 2: XBL authenticate ---
 
-async def authenticate_xbl(msa_token: str) -> tuple[str, str] | None:
+async def authenticate_xbl(msa_token: str, proxy: str | None = None) -> tuple[str, str] | None:
     """Exchange MSA token for Xbox Live token. Returns (token, userhash)."""
     if msa_token.startswith("eyJ"):
         msa_token = f"d={msa_token}"
@@ -118,7 +119,7 @@ async def authenticate_xbl(msa_token: str) -> tuple[str, str] | None:
         "TokenType": "JWT",
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
         print("[2/4] Authenticating with XBL...")
         resp = await client.post(
             XBL_AUTH_URL,
@@ -144,7 +145,7 @@ async def authenticate_xbl(msa_token: str) -> tuple[str, str] | None:
 
 # --- Step 3: XSTS authorize ---
 
-async def authenticate_xsts(xbl_token: str) -> tuple[str, str] | None:
+async def authenticate_xsts(xbl_token: str, proxy: str | None = None) -> tuple[str, str] | None:
     """Exchange XBL token for XSTS token. Returns (token, userhash)."""
     payload = {
         "Properties": {
@@ -155,7 +156,7 @@ async def authenticate_xsts(xbl_token: str) -> tuple[str, str] | None:
         "TokenType": "JWT",
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
         print("[3/4] Authenticating with XSTS...")
         resp = await client.post(
             XSTS_AUTH_URL,
@@ -186,11 +187,11 @@ async def authenticate_xsts(xbl_token: str) -> tuple[str, str] | None:
 
 # --- Step 4: Minecraft login ---
 
-async def minecraft_login(userhash: str, xsts_token: str) -> str | None:
+async def minecraft_login(userhash: str, xsts_token: str, proxy: str | None = None) -> str | None:
     """Exchange XSTS for Minecraft access token (JWT, eyJra...)."""
     identity_token = f"XBL3.0 x={userhash};{xsts_token}"
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
         print("[4/4] Logging into Minecraft...")
         resp = await client.post(
             MC_LOGIN_WITH_XBOX_URL,
@@ -214,29 +215,90 @@ async def minecraft_login(userhash: str, xsts_token: str) -> str | None:
 
 # --- Full chain ---
 
-async def refresh_chain(refresh_token: str) -> tuple[str, str] | None:
+async def refresh_chain(refresh_token: str, proxy: str | None = None) -> tuple[str, str] | None:
     """Returns (mc_access_token, new_refresh_token) or None."""
     print(f"[*] Refresh token: {refresh_token[:40]}... ({len(refresh_token)} chars)")
 
-    result = await refresh_msa_token(refresh_token)
+    result = await refresh_msa_token(refresh_token, proxy)
     if not result:
         return None
     msa, new_refresh = result
 
-    xbl = await authenticate_xbl(msa)
+    xbl = await authenticate_xbl(msa, proxy)
     if not xbl:
         return None
     xbl_token, _xbl_uhs = xbl
 
-    xsts = await authenticate_xsts(xbl_token)
+    xsts = await authenticate_xsts(xbl_token, proxy)
     if not xsts:
         return None
     xsts_token, xsts_uhs = xsts
 
-    mc_token = await minecraft_login(xsts_uhs, xsts_token)
+    mc_token = await minecraft_login(xsts_uhs, xsts_token, proxy)
     if mc_token:
         return mc_token, new_refresh
     return None
+
+
+async def process_refresh_entries(
+    refresh_entries: list[tuple[str, str]],
+    proxy_pool: ProxyPool,
+    token_output,
+    output_path: str,
+) -> tuple[list[str], list[str], int]:
+    """Process bulk refresh entries concurrently and stream successful tokens."""
+    concurrency = max(1, min(len(refresh_entries), len(proxy_pool.proxies) or 5))
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def worker(index: int, username: str, refresh_token: str) -> dict:
+        async with semaphore:
+            print(f"\n{'='*60}")
+            print(f"[*] Processing: refresh.txt line {index + 1}/{len(refresh_entries)}")
+            if username:
+                print(f"[*] Username label: {username}")
+            print(f"[*] Refresh token detected ({len(refresh_token)} chars)")
+            try:
+                result = await proxy_pool.run(
+                    index,
+                    lambda proxy: asyncio.wait_for(refresh_chain(refresh_token, proxy), timeout=60),
+                )
+            except Exception as exc:
+                print(f"[-] Error: {type(exc).__name__}: {exc}")
+                result = None
+            return {
+                "index": index,
+                "username": username,
+                "refresh_token": refresh_token,
+                "result": result,
+                "proxy": None,
+            }
+
+    tasks = [
+        asyncio.create_task(worker(i, username, token))
+        for i, (username, token) in enumerate(refresh_entries)
+    ]
+    all_tokens = []
+    all_refresh = []
+    completed = 0
+    print(f"[*] Starting {len(tasks)} refresh conversions with {concurrency} concurrent worker(s)...")
+    for task in asyncio.as_completed(tasks):
+        item = await task
+        completed += 1
+        result = item["result"]
+        label = item["username"] or f"line {item['index'] + 1}"
+        if result:
+            token, new_refresh = result
+            print(f"\n[+] SUCCESS for {label}! Minecraft access_token (eyJra...):")
+            print(f"    {token[:80]}...{token[-30:]}")
+            all_tokens.append(token)
+            all_refresh.append(format_refresh_entry(item["username"], new_refresh))
+            token_output.write(token + "\n")
+            token_output.flush()
+            print(f"[OK] Access token saved immediately -> {output_path}")
+        else:
+            print(f"[-] Failed for {label}; original refresh token remains in refresh.txt.")
+        print(f"[*] Progress: {completed}/{len(tasks)} completed")
+    return all_tokens, all_refresh, len(tasks)
 
 
 # --- Main ---
@@ -244,6 +306,8 @@ async def refresh_chain(refresh_token: str) -> tuple[str, str] | None:
 def main():
     cwd = os.getcwd()
     print(f"[*] Working directory: {cwd}")
+    proxies = choose_proxies(cwd)
+    proxy_pool = ProxyPool(proxies)
 
     # Only refresh.txt is treated as input. This avoids accidentally reading
     # browser-cookie exports or unrelated .txt files in the working folder.
@@ -259,6 +323,8 @@ def main():
     all_tokens = []
     all_refresh = []
     processed_count = 0
+    output_path = os.path.join(cwd, "token.txt")
+    token_output = open(output_path, "w", encoding="utf-8")
 
     for filepath in txt_files:
         refresh_tokens = read_refresh_tokens(filepath)
@@ -273,46 +339,27 @@ def main():
             continue
 
         print(f"\n[*] {filename}: {len(refresh_tokens)} refresh token(s) found")
+        processable_entries = []
         for token_index, (username, refresh_token) in enumerate(refresh_tokens, start=1):
             if refresh_token.startswith("eyJra"):
                 print(f"\n[!] {filename} line {token_index} is already a Minecraft JWT, skipping.")
                 continue
+            processable_entries.append((username, refresh_token))
 
-            processed_count += 1
-            print(f"\n{'='*60}")
-            print(f"[*] Processing: {filename} (line {token_index}/{len(refresh_tokens)})")
-            if username:
-                print(f"[*] Username label: {username}")
-            print(f"[*] Refresh token detected ({len(refresh_token)} chars)")
-
-            try:
-                result = asyncio.run(refresh_chain(refresh_token))
-            except Exception as e:
-                print(f"[-] Error: {type(e).__name__}: {e}")
-                import traceback
-                traceback.print_exc()
-                result = None
-
-            if result:
-                token, new_refresh = result
-                print(f"\n[+] SUCCESS! Minecraft access_token (eyJra...):")
-                print(f"    {token[:80]}...{token[-30:]}")
-                all_tokens.append(token)
-                all_refresh.append(format_refresh_entry(username, new_refresh))
-            else:
-                print("[-] Failed; keeping the original refresh token for retry.")
+        if processable_entries:
+            processed_tokens, rotated_tokens, processed = asyncio.run(
+                process_refresh_entries(processable_entries, proxy_pool, token_output, output_path)
+            )
+            all_tokens.extend(processed_tokens)
+            all_refresh.extend(rotated_tokens)
+            processed_count += processed
 
     # Save MC access tokens
-    output_path = os.path.join(cwd, "token.txt")
+    token_output.close()
     if all_tokens:
-        with open(output_path, "w", encoding="utf-8") as f:
-            for t in all_tokens:
-                f.write(t + "\n")
         print(f"\n[OK] {len(all_tokens)} MC token(s), one per line -> {output_path}")
     else:
         print(f"\n[XX] No tokens extracted.")
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("")
 
     # Save rotated refresh tokens separately. Keep refresh.txt unchanged as
     # the input/source file; failed entries remain there for a later retry.

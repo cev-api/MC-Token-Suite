@@ -17,6 +17,7 @@ import secrets
 from urllib.parse import urlencode
 
 import httpx
+from proxy_utils import choose_proxies
 
 # --- Constants ---
 
@@ -43,6 +44,7 @@ DEFAULT_USER_AGENT = (
 # Valid skin variants
 SLIM = "slim"
 CLASSIC = "classic"
+ACTIVE_PROXY: str | None = None
 
 
 # --- Token acquisition ---
@@ -65,7 +67,7 @@ def parse_refresh_entry(line: str) -> tuple[str, str]:
 
 async def get_mc_token_from_refresh(refresh_token: str) -> str | None:
     """Turn a refresh token into a fresh MC token via full chain."""
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
         # 1. Refresh MSA
         print("  [1/4] Refreshing MSA...")
         resp = await client.post(
@@ -149,7 +151,7 @@ async def resolve_token() -> str | None:
     if tokens:
         token = tokens[0]
         # Quick check if still valid
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, proxy=ACTIVE_PROXY) as client:
             resp = await client.get(MC_PROFILE_URL, headers={"Authorization": f"Bearer {token}"})
             if resp.status_code == 200:
                 print(f"[*] Using cached MC token from token.txt")
@@ -175,7 +177,7 @@ async def resolve_token() -> str | None:
 async def check_name_available(token: str, name: str) -> bool:
     """Check if a Minecraft username is available."""
     url = MC_NAME_AVAIL_URL.replace("{name}", name)
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, proxy=ACTIVE_PROXY) as client:
         resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code == 200:
             data = resp.json()
@@ -185,7 +187,7 @@ async def check_name_available(token: str, name: str) -> bool:
 
 async def change_name(token: str, new_name: str) -> bool:
     """Change the Minecraft username."""
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, proxy=ACTIVE_PROXY) as client:
         resp = await client.post(
             MC_NAME_CHANGE_URL,
             json={"name": new_name},
@@ -216,7 +218,7 @@ async def change_skin_from_url(token: str, skin_url: str, variant: str = CLASSIC
         print(f"    Invalid variant: {variant} (use 'classic' or 'slim')")
         return False
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
         # Download the skin first to check it's valid
         print(f"    Downloading skin from URL...")
         img_resp = await client.get(skin_url)
@@ -263,7 +265,7 @@ async def change_skin_from_file(token: str, filepath: str, variant: str = CLASSI
 
     print(f"    Read {len(skin_data)} bytes from {filepath}")
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
         resp = await client.post(
             MC_SKIN_URL,
             headers={"Authorization": f"Bearer {token}"},
@@ -281,7 +283,7 @@ async def change_skin_from_file(token: str, filepath: str, variant: str = CLASSI
 
 async def reset_skin(token: str) -> bool:
     """Reset skin to default (Steve/Alex)."""
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, proxy=ACTIVE_PROXY) as client:
         resp = await client.delete(
             MC_SKIN_URL,
             headers={"Authorization": f"Bearer {token}"},
@@ -296,6 +298,9 @@ async def reset_skin(token: str) -> bool:
 # --- Main menu ---
 
 async def main():
+    global ACTIVE_PROXY
+    proxies = choose_proxies(os.getcwd())
+    ACTIVE_PROXY = proxies[0] if proxies else None
     print("=" * 55)
     print("  Minecraft Account Manager")
     print("=" * 55)
@@ -305,7 +310,7 @@ async def main():
         sys.exit(1)
 
     # Show current profile
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, proxy=ACTIVE_PROXY) as client:
         resp = await client.get(MC_PROFILE_URL, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code != 200:
             print("[!] Token rejected by Minecraft API.")

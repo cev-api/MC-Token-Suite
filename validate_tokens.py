@@ -13,6 +13,7 @@ import re
 from datetime import datetime, timezone
 
 import httpx
+from proxy_utils import PROXY_FAILURE_RETRIES, ProxyPool, choose_proxies, proxy_label as shared_proxy_label
 
 # --- Constants ---
 
@@ -283,6 +284,8 @@ def read_proxies(filepath: str) -> list[str]:
                     f"http://{quote(username, safe='')}:{quote(password, safe='')}"
                     f"@{host}:{port}"
                 )
+            elif fields[-1] == "1080":
+                proxy = f"socks5://{line}"
             else:
                 proxy = f"http://{line}"
         else:
@@ -484,7 +487,8 @@ def format_mc_result(result: dict) -> list[str]:
 async def main():
     cwd = os.getcwd()
     print(f"Working dir: {cwd}\n")
-    proxies = read_proxies(os.path.join(cwd, "proxy.txt"))
+    proxies = choose_proxies(cwd)
+    proxy_pool = ProxyPool(proxies)
     if proxies:
         print(f"[*] Loaded {len(proxies)} proxy/proxies from proxy.txt (round-robin)\n")
     else:
@@ -588,10 +592,20 @@ async def main():
                 result["index"] = index
                 return result
 
+        async def validate_with_failover(index, entry):
+            last_result = None
+            for attempt in range(PROXY_FAILURE_RETRIES):
+                proxy = proxy_pool.candidate_for_attempt(index, attempt)
+                result = await limited_validate(index, entry, proxy)
+                result["proxy_attempts"] = attempt + 1
+                if result["status"] not in {"ERROR", "TIMEOUT"}:
+                    return result
+                proxy_pool.mark_failed(proxy)
+                last_result = result
+            return last_result
+
         tasks = [
-            asyncio.create_task(
-                limited_validate(i, entry, proxies[i % len(proxies)] if proxies else None)
-            )
+            asyncio.create_task(validate_with_failover(i, entry))
             for i, entry in enumerate(refresh_entries)
         ]
         results = [None] * len(tasks)
@@ -619,10 +633,9 @@ async def main():
             print(f"[*] Retrying {len(timed_out)} timed-out account(s)...")
             retry_tasks = [
                 asyncio.create_task(
-                    limited_validate(
+                    validate_with_failover(
                         result["index"],
                         refresh_entries[result["index"]],
-                        proxies[(result["index"] + 1) % len(proxies)] if proxies else None,
                     )
                 )
                 for result in timed_out
@@ -654,6 +667,8 @@ async def main():
                 print(f"      Username label: {username_label}")
             if result["proxy"]:
                 print(f"      Proxy: {proxy_label(result['proxy'])}")
+            if result.get("proxy_attempts", 1) > 1:
+                print(f"      Proxy attempts: {result['proxy_attempts']}")
             print(f"      Prefix: {rt[:50]}...")
 
             if rt.startswith("eyJ"):

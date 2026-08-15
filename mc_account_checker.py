@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+from proxy_utils import choose_proxies
 
 
 AUTH_NAME_AVAILABILITY_URL = "https://api.minecraftservices.com/minecraft/profile/name/{username}/available"
@@ -25,6 +26,7 @@ ASHCON_PROFILE_URL = "https://api.ashcon.app/mojang/v2/user/{username}"
 VRC_PROFILE_URL = "https://vrc.lol/api"
 LIFORRA_NAME_HISTORY_URL = "https://liforra.de/api/namehistory"
 TOKEN_FILE = Path("token.txt")
+ACTIVE_PROXY: str | None = None
 NAME_HOLD = timedelta(days=37)
 class CheckError(RuntimeError):
     """A required profile or availability request could not be completed."""
@@ -289,7 +291,7 @@ async def check_username(username: str) -> None:
     if tokens:
         print(f"[*] Trying {len(tokens)} token(s) from {TOKEN_FILE} for availability confirmation...")
 
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, proxy=ACTIVE_PROXY) as client:
         authenticated = await request_availability(client, username, tokens, "token.txt") if tokens else None
         if authenticated is None:
             if tokens:
@@ -323,6 +325,9 @@ async def check_username(username: str) -> None:
 
 
 def main() -> None:
+    global ACTIVE_PROXY
+    proxies = choose_proxies(".")
+    ACTIVE_PROXY = proxies[0] if proxies else None
     print("Minecraft Username & Account Checker")
     print("Checks the username you enter; token.txt is only used for availability confirmation.\n")
     try:

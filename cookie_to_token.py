@@ -16,6 +16,7 @@ import json
 from urllib.parse import urlencode, urlparse, parse_qs
 
 import httpx
+from proxy_utils import ProxyPool, choose_proxies
 
 # --- Constants ---
 
@@ -83,7 +84,7 @@ def extract_code_from_location(location: str) -> str | None:
 
 # --- Step 1: Get MSA token from cookies ---
 
-async def get_msa_token(cookie_header: str) -> tuple[str, str] | None:
+async def get_msa_token(cookie_header: str, proxy: str | None = None) -> tuple[str, str] | None:
     """Exchange session cookies for an MSA access_token + refresh_token (v1 flow).
     Returns (access_token, refresh_token) or None."""
     verifier, challenge = make_pkce()
@@ -98,7 +99,7 @@ async def get_msa_token(cookie_header: str) -> tuple[str, str] | None:
     }
     authorize_url = f"{LIVE_CONNECT_AUTHORIZE_URL}?{urlencode(params)}"
 
-    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False, proxy=proxy) as client:
         print("[1/5] GET authorize (v1)...")
         resp = await client.get(authorize_url, headers={"Cookie": cookie_header, "User-Agent": DEFAULT_USER_AGENT})
 
@@ -148,7 +149,7 @@ async def get_msa_token(cookie_header: str) -> tuple[str, str] | None:
 
 # --- Step 2: XBL authenticate ---
 
-async def authenticate_xbl(msa_token: str) -> tuple[str, str] | None:
+async def authenticate_xbl(msa_token: str, proxy: str | None = None) -> tuple[str, str] | None:
     """Exchange MSA token for Xbox Live token. Returns (token, userhash)."""
     # v1 Live-Connect opaque tokens (Ew...) need t= prefix
     # v2 Azure AD JWT tokens (eyJ...) need d= prefix
@@ -167,7 +168,7 @@ async def authenticate_xbl(msa_token: str) -> tuple[str, str] | None:
         "TokenType": "JWT",
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
         print("[2/5] Authenticating with XBL...")
         resp = await client.post(
             XBL_AUTH_URL,
@@ -193,7 +194,7 @@ async def authenticate_xbl(msa_token: str) -> tuple[str, str] | None:
 
 # --- Step 3: XSTS authorize ---
 
-async def authenticate_xsts(xbl_token: str) -> tuple[str, str] | None:
+async def authenticate_xsts(xbl_token: str, proxy: str | None = None) -> tuple[str, str] | None:
     """Exchange XBL token for XSTS token. Returns (token, userhash)."""
     payload = {
         "Properties": {
@@ -204,7 +205,7 @@ async def authenticate_xsts(xbl_token: str) -> tuple[str, str] | None:
         "TokenType": "JWT",
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
         print("[3/5] Authenticating with XSTS...")
         resp = await client.post(
             XSTS_AUTH_URL,
@@ -242,11 +243,11 @@ async def authenticate_xsts(xbl_token: str) -> tuple[str, str] | None:
 
 # --- Step 4: Minecraft login_with_xbox ---
 
-async def minecraft_login(userhash: str, xsts_token: str) -> str | None:
+async def minecraft_login(userhash: str, xsts_token: str, proxy: str | None = None) -> str | None:
     """Exchange XSTS for Minecraft access token (JWT, eyJra...)."""
     identity_token = f"XBL3.0 x={userhash};{xsts_token}"
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
         print("[4/5] Logging into Minecraft...")
         resp = await client.post(
             MC_LOGIN_WITH_XBOX_URL,
@@ -270,32 +271,32 @@ async def minecraft_login(userhash: str, xsts_token: str) -> str | None:
 
 # --- Full chain ---
 
-async def extract_token(cookies: list[dict]) -> tuple[str, str] | None:
+async def extract_token(cookies: list[dict], proxy: str | None = None) -> tuple[str, str] | None:
     """Full chain. Returns (mc_access_token, msa_refresh_token) or None."""
     cookie_header = build_cookie_header(cookies)
     print(f"[*] Cookie header: {len(cookie_header)} chars, {len(cookies)} cookies")
 
     # Step 1: MSA token
-    result = await get_msa_token(cookie_header)
+    result = await get_msa_token(cookie_header, proxy)
     if not result:
         print("[!] MSA token extraction failed.")
         return None
     msa, refresh_token = result
 
     # Step 2: XBL
-    xbl = await authenticate_xbl(msa)
+    xbl = await authenticate_xbl(msa, proxy)
     if not xbl:
         return None
     xbl_token, _xbl_uhs = xbl
 
     # Step 3: XSTS
-    xsts = await authenticate_xsts(xbl_token)
+    xsts = await authenticate_xsts(xbl_token, proxy)
     if not xsts:
         return None
     xsts_token, xsts_uhs = xsts
 
     # Step 4: Minecraft
-    mc_token = await minecraft_login(xsts_uhs, xsts_token)
+    mc_token = await minecraft_login(xsts_uhs, xsts_token, proxy)
     if mc_token:
         return mc_token, refresh_token or ""
     return None
@@ -303,6 +304,8 @@ async def extract_token(cookies: list[dict]) -> tuple[str, str] | None:
 
 def main():
     cwd = os.getcwd()
+    proxies = choose_proxies(cwd)
+    proxy_pool = ProxyPool(proxies)
     print(f"[*] Working directory: {cwd}")
 
     txt_files = find_cookie_files(cwd)
@@ -317,7 +320,7 @@ def main():
     all_tokens = []   # MC access tokens for token.txt
     all_refresh = []  # MSA refresh tokens for refresh.txt
 
-    for filepath in txt_files:
+    for file_index, filepath in enumerate(txt_files):
         print(f"\n{'='*60}")
         print(f"[*] Processing: {os.path.basename(filepath)}")
 
@@ -329,7 +332,9 @@ def main():
             continue
 
         try:
-            result = asyncio.run(extract_token(cookies))
+            result = asyncio.run(
+                proxy_pool.run(file_index, lambda proxy: extract_token(cookies, proxy))
+            )
         except Exception as e:
             print(f"[-] Error: {type(e).__name__}: {e}")
             import traceback

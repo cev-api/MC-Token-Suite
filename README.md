@@ -16,6 +16,11 @@ python -m pip install -r requirements.txt
 Run the commands from this project directory. Python 3.10 or newer is
 recommended because the scripts use modern type-annotation syntax.
 
+If `proxy.txt` or `proxies.txt` exists, each network-using script asks whether
+to use the listed proxies. Supported entries include `http://host:port`,
+`https://host:port`, `socks5://host:port`, `socks5h://host:port`, bare
+`host:port`, and authenticated `host:port:username:password`.
+
 ## Scripts
 
 ### 1. `cookie_to_token.py`
@@ -45,9 +50,11 @@ python refresh_to_token.py
 - Reads `refresh.txt` with one refresh token per line, or `USERNAME:REFRESHTOKEN`
   entries
 - Refreshes every line through MSA -> XBL -> XSTS -> Minecraft
+- Processes bulk refresh entries concurrently, rotating through configured proxies
 - Preserves username labels when rotated or failed tokens are written back
 - Outputs:
-  - `token.txt` - fresh Minecraft access tokens, one per line
+  - `token.txt` - fresh Minecraft access tokens, written and flushed immediately
+    after each successful account
   - `rotated_refresh_YYYY-MM-DD_HH-MM-SS.txt` - newly rotated refresh tokens, one per line
     (failed input tokens remain unchanged in `refresh.txt` for retry)
 
