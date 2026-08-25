@@ -249,7 +249,8 @@ def format_refresh_entry(username: str, refresh_token: str) -> str:
 
 def output_refresh_entry(result: dict) -> str:
     """Format a successful refresh result with the best available username."""
-    label = result["username_label"] or result["profile_name"]
+    # Prefer the resolved profile name because input labels can be stale after a rename.
+    label = result["profile_name"] or result["username_label"]
     if result["new_refresh_entry"]:
         token = result["new_refresh_entry"].split(":", 1)[-1]
     else:
@@ -323,6 +324,7 @@ async def validate_refresh_entry(
         "new_refresh_entry": "",
         "result": None,
         "profile_error": "",
+        "error": "",
     }
 
     if refresh_token.startswith("eyJ"):
@@ -354,7 +356,8 @@ async def validate_refresh_entry(
             result["profile_error"] = "profile lookup failed"
     except Exception as exc:
         result["status"] = "ERROR"
-        result["profile_error"] = f"{type(exc).__name__}: {exc}"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["profile_error"] = result["error"]
     return result
 
 
@@ -588,6 +591,7 @@ async def main():
                         "new_refresh_entry": "",
                         "result": {"status": "timeout", "body": "30-second account timeout"},
                         "profile_error": "30-second account timeout",
+                        "error": "TimeoutError: validation exceeded 30 seconds",
                     }
                 result["index"] = index
                 return result
@@ -702,14 +706,19 @@ async def main():
             validation = result["result"] or {}
             verbose_file.write(
                 f"[{result['index'] + 1}] "
-                f"{result['username_label'] or result['profile_name'] or '(no username label)'}\n"
+                f"{result['profile_name'] or result['username_label'] or '(no username label)'}\n"
                 f"Status: {result['status']}\n"
+                f"Input label: {result['username_label'] or '(none)'}\n"
                 f"Token prefix: {result['refresh_token'][:50]}...\n"
                 f"Proxy: {proxy_label(result['proxy']) if result['proxy'] else 'direct'}\n"
+                f"Proxy attempts: {result.get('proxy_attempts', 1)}\n"
                 f"Minecraft name: {result['profile_name'] or '(unknown)'}\n"
                 f"Minecraft UUID: {result['profile_uuid'] or '(unknown)'}\n"
                 f"MSA user ID: {validation.get('user_id', '(unknown)')}\n"
                 f"Expires in: {validation.get('expires_in', '(unknown)')}\n"
+                f"HTTP status: {validation.get('status', '(none)')}\n"
+                f"Response: {validation.get('body', '(none)')}\n"
+                f"Error: {result.get('error') or result.get('profile_error') or '(none)'}\n"
                 f"Saved refresh entry: {output_refresh_entry(result) if result['status'] == 'VALID' else '(none)'}\n\n"
             )
         verbose_file.flush()

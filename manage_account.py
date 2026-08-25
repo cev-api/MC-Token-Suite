@@ -65,6 +65,68 @@ def parse_refresh_entry(line: str) -> tuple[str, str]:
     return "", line.strip()
 
 
+def mask_token(token: str) -> str:
+    """Return a short, non-sensitive identifier for a token."""
+    if len(token) <= 8:
+        return "*" * len(token)
+    return f"{token[:4]}...{token[-4:]}"
+
+
+def choose_entry(entries: list[str], source: str, labels: list[str] | None = None) -> str:
+    """Prompt for an entry when a token file contains more than one."""
+    if len(entries) == 1:
+        return entries[0]
+
+    print(f"[*] Multiple entries found in {source}:")
+    for index, entry in enumerate(entries, start=1):
+        label = labels[index - 1] if labels else mask_token(entry)
+        print(f"  [{index}] {label}")
+
+    while True:
+        choice = input(f"  Choose an entry [1-{len(entries)}]: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(entries):
+            return entries[int(choice) - 1]
+        print("  Please enter a valid number.")
+
+
+
+def choose_source(has_tokens: bool, has_refresh: bool) -> str:
+    """Choose the credential file when both are available."""
+    if has_tokens and not has_refresh:
+        return "token"
+    if has_refresh and not has_tokens:
+        return "refresh"
+
+    print("[*] Credential sources found:")
+    print("  [1] token.txt (cached Minecraft tokens)")
+    print("  [2] refresh.txt (Microsoft refresh tokens)")
+    while True:
+        choice = input("  Read from [1-2]: ").strip()
+        if choice == "1":
+            return "token"
+        if choice == "2":
+            return "refresh"
+        print("  Please enter 1 or 2.")
+
+
+async def get_token_labels(tokens: list[str]) -> list[str]:
+    """Fetch Minecraft names for cached tokens, marking invalid entries."""
+    async with httpx.AsyncClient(timeout=10, proxy=ACTIVE_PROXY) as client:
+        async def fetch_label(token: str) -> str:
+            try:
+                resp = await client.get(
+                    MC_PROFILE_URL,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError:
+                return f"UNREACHABLE - {mask_token(token)}"
+            if resp.status_code == 200:
+                return resp.json().get("name", "Unknown account")
+            return f"INVALID ({resp.status_code}) - {mask_token(token)}"
+
+        return await asyncio.gather(*(fetch_label(token) for token in tokens))
+
+
 async def get_mc_token_from_refresh(refresh_token: str) -> str | None:
     """Turn a refresh token into a fresh MC token via full chain."""
     async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
@@ -143,34 +205,36 @@ async def get_mc_token_from_refresh(refresh_token: str) -> str | None:
 
 
 async def resolve_token() -> str | None:
-    """Get a valid MC token: token.txt first, fallback to refresh.txt chain."""
+    """Select a credential source, then resolve it to a Minecraft token."""
     cwd = os.getcwd()
-
-    # Try token.txt first
     tokens = read_lines(os.path.join(cwd, "token.txt"))
-    if tokens:
-        token = tokens[0]
-        # Quick check if still valid
+    refresh_lines = read_lines(os.path.join(cwd, "refresh.txt"))
+
+    if not tokens and not refresh_lines:
+        print("[!] No token.txt or refresh.txt found. Run cookie_to_token.py first.")
+        return None
+
+    source = choose_source(bool(tokens), bool(refresh_lines))
+    if source == "token":
+        labels = await get_token_labels(tokens) if len(tokens) > 1 else None
+        token = choose_entry(tokens, "token.txt", labels)
         async with httpx.AsyncClient(timeout=10, proxy=ACTIVE_PROXY) as client:
             resp = await client.get(MC_PROFILE_URL, headers={"Authorization": f"Bearer {token}"})
             if resp.status_code == 200:
-                print(f"[*] Using cached MC token from token.txt")
+                print("[*] Using cached MC token from token.txt")
                 return token
-        print("[*] Cached MC token expired, refreshing...")
-    else:
-        print("[*] No token.txt found, trying refresh...")
+        print("[!] Selected MC token is invalid or expired.")
+        return None
 
-    # Fallback to refresh.txt
-    refresh_lines = read_lines(os.path.join(cwd, "refresh.txt"))
-    if refresh_lines:
-        username, refresh_token = parse_refresh_entry(refresh_lines[0])
-        label = f" for {username}" if username else ""
-        print(f"[*] Using refresh token{label} from refresh.txt")
-        return await get_mc_token_from_refresh(refresh_token)
-
-    print("[!] No token.txt or refresh.txt found. Run cookie_to_token.py first.")
-    return None
-
+    refresh_labels = []
+    for entry in refresh_lines:
+        username, refresh_token = parse_refresh_entry(entry)
+        refresh_labels.append(username or mask_token(refresh_token))
+    selected_refresh = choose_entry(refresh_lines, "refresh.txt", refresh_labels)
+    username, refresh_token = parse_refresh_entry(selected_refresh)
+    label = f" for {username}" if username else ""
+    print(f"[*] Using refresh token{label} from refresh.txt")
+    return await get_mc_token_from_refresh(refresh_token)
 
 # --- Name operations ---
 
