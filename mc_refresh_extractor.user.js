@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MC Refresh Token Extractor
 // @namespace    mc-token-suite
-// @version      3.9.2
+// @version      3.9.7
 // @description  Like cookie_to_token.py but in your browser: uses your live login.live.com session (real browser navigation, so the session cookies are sent natively) to get the MSA refresh token, then runs the XBL -> XSTS -> Minecraft chain for a fresh MC access token. Also scans the session for an access token already stored in cookies/localStorage, and can inject pasted cookies to replace the login.live.com session.
 // @author       you
 // @match        https://login.live.com/*
@@ -28,7 +28,8 @@
 (function () {
     'use strict';
 
-    // ==================== config ====================    const CLIENT_ID = '00000000402b5328'; // Minecraft Launcher v1 (desktop client)
+    // ==================== config ====================
+    const CLIENT_ID = '00000000402b5328'; // Minecraft Launcher v1 (desktop client)
     const REDIRECT_URI = 'https://login.live.com/oauth20_desktop.srf';
     const SCOPE = 'service::user.auth.xboxlive.com::MBI_SSL';
     const AUTHORIZE_URL = 'https://login.live.com/oauth20_authorize.srf';
@@ -427,6 +428,38 @@
         return cookies;
     }
 
+    // Hosts whose cookies get wiped before/after injection.
+    const COOKIE_URLS = [
+        'https://login.live.com/',
+        'https://www.live.com/',
+        'https://account.live.com/',
+        'https://www.minecraft.net/',
+        'https://minecraft.net/',
+    ];
+
+    // List + delete every cookie for the live/minecraft hosts.
+    async function deleteAllSessionCookies() {
+        const removed = [];
+        for (const url of COOKIE_URLS) {
+            const existing = await gmCookieList(url);
+            for (const c of existing) {
+                if (!c || !c.name) continue;
+                // Delete via the cookie's own domain when it differs from the
+                // listing URL so nothing is left behind.
+                let delUrl = url;
+                if (c.domain) {
+                    const base = c.domain.replace(/^\./, '');
+                    if (/^[a-z0-9.-]+$/i.test(base) && !delUrl.includes(base)) {
+                        delUrl = 'https://' + base + '/';
+                    }
+                }
+                await gmCookieDelete(delUrl, c.name);
+                removed.push(c.name);
+            }
+        }
+        return removed;
+    }
+
     // Replace the login.live.com session with the pasted cookies.
     async function applyCookies() {
         if (typeof GM_cookie === 'undefined') {
@@ -439,11 +472,8 @@
             return;
         }
         const url = 'https://login.live.com/';
-        setStatus('Clearing existing login.live.com cookies…', null);
-        const existing = await gmCookieList(url);
-        for (const c of existing) {
-            if (c && c.name) await gmCookieDelete(url, c.name);
-        }
+        setStatus('Clearing existing login.live.com / minecraft.net cookies…', null);
+        await deleteAllSessionCookies();
         setStatus(`Setting ${cookies.length} cookie(s)…`, null);
         let okCount = 0;
         for (const c of cookies) {
@@ -471,12 +501,8 @@
             setStatus('❌ Needs Tampermonkey (GM_cookie).', 'err');
             return;
         }
-        const url = 'https://login.live.com/';
-        const existing = await gmCookieList(url);
-        for (const c of existing) {
-            if (c && c.name) await gmCookieDelete(url, c.name);
-        }
-        setStatus(`🧹 Removed ${existing.length} login.live.com cookie(s).`, 'ok');
+        const removed = await deleteAllSessionCookies();
+        setStatus(`🧹 Removed ${removed.length} login.live.com / minecraft.net cookie(s).`, 'ok');
     }
 
     // ==================== panel UI ====================
@@ -560,7 +586,7 @@
                         <button class="mcrte-btn small" id="mcrte-apply-cookies">Apply cookies</button>
                         <button class="mcrte-btn small danger" id="mcrte-clear-cookies">Clear cookies</button>
                     </div>
-                    <div class="mcrte-note">Deletes the current login.live.com session first, then sets the pasted cookies (incl. HttpOnly). Runs in the default cookie store - use a normal tab if your tab group is isolated.</div>
+                    <div class="mcrte-note">Deletes the current login.live.com + minecraft.net cookies first, then sets the pasted cookies (incl. HttpOnly). Runs in the default cookie store - use a normal tab if your tab group is isolated.</div>
                 </details>
 
                 <div class="mcrte-footer">
@@ -657,6 +683,31 @@
         updateSaved(lines);
     }
 
+    // A cross-origin OAuth redirect may refuse window.close(), so always leave
+    // a clear fallback message for the user when the Microsoft tab survives.
+    let resultRefreshTimer = null;
+
+    // Refresh the Minecraft tab after delivery so the user does not have to
+    // notice or dismiss a transient popup/notification.
+    function refreshMinecraftPage() {
+        if (resultRefreshTimer) return;
+        setStatus('✅ Done! Token saved. Refreshing the Minecraft page…', 'ok');
+        resultRefreshTimer = setTimeout(() => {
+            try { location.reload(); } catch (e) {}
+        }, 1500);
+    }
+
+    function closeMicrosoftTab() {
+        try { window.close(); } catch (e) {}
+        setTimeout(() => {
+            try {
+                if (!window.closed) {
+                    setStatus('✅ Done! Token saved. Close this Microsoft tab, return to Minecraft, and refresh the Minecraft page.', 'ok');
+                }
+            } catch (e) {}
+        }, 1200);
+    }
+
     async function finishSuccess(data, flowId) {
         const refresh = data.refresh_token || '';
         const msaAccess = data.access_token || '';
@@ -693,17 +744,7 @@
         if (window.opener) {
             // Deliver the result to the opener.
             const payload = { source: 'mcrt', refresh: refresh, access: mc || msaAccess || '', note: note };
-            let posted = false;
-            for (let i = 0; i < 5; i++) {
-                try {
-                    window.opener.postMessage(payload, '*');
-                    posted = true;
-                    break;
-                } catch (e) {
-                    await new Promise(r => setTimeout(r, 400));
-                }
-            }
-            // Also write it to the opener's window.name.
+            try { window.opener.postMessage(payload, '*'); } catch (e) {}
             try {
                 window.opener.name = 'mcrt_result:' + JSON.stringify({
                     refresh: refresh,
@@ -718,9 +759,10 @@
                     note: note,
                 });
             } catch (e) {}
-            // Also save a GM storage payload for the opener.
+            // GM storage payload keyed by flow id - unambiguous ownership.
             try {
-                GM_setValue('mcrt_deliver', JSON.stringify({
+                const key = flowId ? 'mcrt_deliver_' + flowId : 'mcrt_deliver';
+                GM_setValue(key, JSON.stringify({
                     refresh: refresh,
                     access: mc || msaAccess || '',
                     note: note,
@@ -728,24 +770,13 @@
                     flowId: flowId || '',
                 }));
             } catch (e) {}
-            setStatus('✅ Tokens captured - sent to the tab you came from. Closing…', 'ok');
+            setStatus('✅ Done! Token saved and sent back to Minecraft. This Microsoft tab will now close.', 'ok');
             if (refresh) copyText(refresh);
-            const closeIt = () => { try { window.close(); } catch (e) {} };
-            if (posted) {
-                setTimeout(closeIt, 1500);
-            } else {
-                // Close on ack or after 5s.
-                setTimeout(closeIt, 5000);
-                let n = 0;
-                const iv = setInterval(() => {
-                    n++;
-                    let name = '';
-                    try { name = window.name || ''; } catch (e) {}
-                    if (name === 'mcrt_ack' || n > 25) { clearInterval(iv); closeIt(); }
-                }, 200);
-            }
+            // Try both sides: the opener normally closes the popup handle, but
+            // this page also closes itself so navigation cannot leave it open.
+            setTimeout(closeMicrosoftTab, 250);
         } else if (refresh) {
-            setStatus('✅ Tokens captured & copied to clipboard. You can close this tab.', 'ok');
+            setStatus('✅ Done! Refresh token saved and copied. Close this Microsoft tab, return to Minecraft, and refresh the Minecraft page.', 'ok');
         }
     }
 
@@ -794,10 +825,15 @@
     function applyResult(res) {
         if (!res || !panel) return;
         showResult(res.refresh, res.access, loadTokens(), res.note || '');
-        setStatus('✅ Refresh token received from the popup - copied to clipboard.', 'ok');
+        setStatus('✅ Done! Refresh token saved. Refreshing the Minecraft page…', 'ok');
         if (res.refresh) copyText(res.refresh);
+        refreshMinecraftPage();
         try {
             localStorage.setItem('mcrt_result', JSON.stringify({ refresh: res.refresh || '', access: res.access || '' }));
+        } catch (e) {}
+        try {
+            const myFlow = sessionStorage.getItem('mcrt_flowid') || '';
+            if (myFlow) GM_setValue('mcrt_deliver_' + myFlow, '');
         } catch (e) {}
         try { GM_setValue('mcrt_deliver', ''); } catch (e) {}
         try { sessionStorage.removeItem('mcrt_flowid'); } catch (e) {}
@@ -806,23 +842,37 @@
     // Pick up a GM storage delivery for this tab's flow.
     function tryPickupDeliver() {
         try {
+            const myFlow = sessionStorage.getItem('mcrt_flowid') || '';
+            const tryApply = (key, rec) => {
+                if (!rec || !rec.refresh) { GM_setValue(key, ''); return false; }
+                if ((Date.now() - (rec.ts || 0)) > 600000) { GM_setValue(key, ''); return false; }
+                GM_setValue(key, '');
+                applyResult(rec);
+                return true;
+            };
+            // Flow-keyed payload - unambiguous ownership.
+            if (myFlow) {
+                const raw = GM_getValue('mcrt_deliver_' + myFlow, '');
+                if (raw) {
+                    let rec = null;
+                    try { rec = JSON.parse(raw); } catch (e) {}
+                    if (tryApply('mcrt_deliver_' + myFlow, rec)) return true;
+                }
+            }
+            // Legacy unkeyed payload.
             const raw = GM_getValue('mcrt_deliver', '');
             if (!raw) return false;
             const rec = JSON.parse(raw);
-            const myFlow = sessionStorage.getItem('mcrt_flowid') || '';
-            if (!rec || !rec.refresh) { GM_setValue('mcrt_deliver', ''); return false; }
-            if ((Date.now() - (rec.ts || 0)) > 600000) { GM_setValue('mcrt_deliver', ''); return false; }
-            // Only consume this tab's flow.
-            if (rec.flowId && rec.flowId !== myFlow) return false;
+            if (rec.flowId && myFlow && rec.flowId !== myFlow) return false;
             if (!rec.flowId && !myFlow) return false;
-            GM_setValue('mcrt_deliver', '');
-            applyResult(rec);
-            return true;
+            return tryApply('mcrt_deliver', rec);
         } catch (e) { return false; }
     }
 
+    let popupHandle = null;
     // Poll for the popup result.
     function startResultPolling(win) {
+        popupHandle = win;
         let done = false;
         const apply = () => {
             if (done) return;
@@ -833,14 +883,21 @@
                 done = true;
                 try { window.name = ''; } catch (e) {}
                 try { applyResult(JSON.parse(name.slice('mcrt_result:'.length))); } catch (e) {}
+                closePopup();
                 return;
             }
             // GM storage fallback.
-            if (tryPickupDeliver()) done = true;
+            if (tryPickupDeliver()) { done = true; closePopup(); }
         };
         const poll = setInterval(apply, 400);
         setTimeout(() => { clearInterval(poll); done = true; }, 120000);
         window.addEventListener('focus', apply);
+    }
+    // Close the popup window we own (same-tab flows have no popup).
+    function closePopup() {
+        if (!popupHandle) return;
+        try { popupHandle.close(); } catch (e) {}
+        popupHandle = null;
     }
 
     async function startFlow() {
@@ -935,6 +992,16 @@
                 setStatus('🔑 Found in this tab: ' + parts.join('; ') + '.', 'ok');
             }
         } catch (e) {}
+        // If a flow is in flight but delivery has not landed, recover the
+        // refresh token from the saved list (the popup always saves it).
+        try {
+            if (!panel.querySelector('#mcrte-refresh').value && sessionStorage.getItem('mcrt_flowid')) {
+                const saved = loadTokens();
+                if (saved.length) {
+                    panel.querySelector('#mcrte-refresh').value = saved[saved.length - 1];
+                }
+            }
+        } catch (e) {}
         updateSaved(loadTokens());
     }
 
@@ -979,12 +1046,8 @@
         window.addEventListener('message', (ev) => {
             if (!ev.data || ev.data.source !== 'mcrt') return;
             if (ev.origin !== 'https://login.live.com') return;
-            showResult(ev.data.refresh, ev.data.access, loadTokens(), ev.data.note || '');
-            setStatus('✅ Refresh token received from the popup - copied to clipboard.', 'ok');
-            if (ev.data.refresh) copyText(ev.data.refresh);
-            try {
-                localStorage.setItem('mcrt_result', JSON.stringify({ refresh: ev.data.refresh || '', access: ev.data.access || '' }));
-            } catch (e) {}
+            applyResult(ev.data);
+            closePopup();
         });
 
         const isDesktopRedirect = isLive && location.pathname.includes('oauth20_desktop.srf');
@@ -993,24 +1056,38 @@
             handleDesktopRedirect(code);
             return;
         }
-        // Re-show tokens and close after a reload.
+        // Re-show a completed result after the OAuth URL has been replaced or
+        // the redirect page has reloaded. GM storage is the source of truth:
+        // localStorage may be unavailable or cleared on Microsoft redirect pages.
         if (isDesktopRedirect) {
             try {
-                if (localStorage.getItem('mcrt_done')) {
-                    const saved = JSON.parse(localStorage.getItem('mcrt_result') || 'null');
-                    if (saved) {
-                        if (saved.refresh && !panel.querySelector('#mcrte-refresh').value) {
-                            panel.querySelector('#mcrte-refresh').value = saved.refresh;
-                        }
-                        if (saved.access && !panel.querySelector('#mcrte-access').value) {
-                            panel.querySelector('#mcrte-access').value = saved.access;
-                        }
+                let completed = false;
+                const saved = JSON.parse(localStorage.getItem('mcrt_result') || 'null');
+                if (saved) {
+                    if (saved.refresh && !panel.querySelector('#mcrte-refresh').value) {
+                        panel.querySelector('#mcrte-refresh').value = saved.refresh;
                     }
+                    if (saved.access && !panel.querySelector('#mcrte-access').value) {
+                        panel.querySelector('#mcrte-access').value = saved.access;
+                    }
+                    completed = !!saved.refresh;
+                }
+                // The token is saved in GM storage before the redirect page is
+                // marked done, so this also handles the exact stuck-Ready case.
+                const savedLines = loadTokens();
+                if (savedLines.length) {
+                    if (!panel.querySelector('#mcrte-refresh').value) {
+                        panel.querySelector('#mcrte-refresh').value = savedLines[savedLines.length - 1];
+                    }
+                    updateSaved(savedLines);
+                    completed = true;
+                }
+                if (completed) {
                     if (window.opener) {
-                        setStatus('✅ Done - tokens sent back. Closing…', 'ok');
-                        setTimeout(() => { try { window.close(); } catch (e) {} }, 800);
+                        setStatus('✅ Done! Tokens sent back. Closing this Microsoft tab…', 'ok');
+                        setTimeout(closeMicrosoftTab, 250);
                     } else {
-                        setStatus('✅ Done - tokens captured. You can close this tab.', 'ok');
+                        setStatus('✅ Done! Token saved. Close this Microsoft tab, return to Minecraft, and refresh the Minecraft page.', 'ok');
                     }
                 }
             } catch (e) {}
