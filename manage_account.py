@@ -1,6 +1,8 @@
 """
 Account Manager - Name Change & Skin Change
-Reads token.txt (or refresh.txt → full chain) and allows:
+Reads token.txt or refresh.txt, or accepts a pasted cookie export, refresh
+token, or access token, and allows:
+  - Showing the account's username (name change) history and cooldown
   - Changing the Minecraft username (if eligible)
   - Changing the Minecraft skin (from URL or local file)
   - Resetting the skin to default
@@ -14,7 +16,9 @@ import base64
 import json
 import hashlib
 import secrets
-from urllib.parse import urlencode
+import re
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 from proxy_utils import choose_proxies
@@ -26,6 +30,12 @@ MC_NAME_CHANGE_URL = "https://api.minecraftservices.com/minecraft/profile/namech
 MC_NAME_AVAIL_URL = "https://api.minecraftservices.com/minecraft/profile/name/{name}/available"
 MC_SKIN_URL = "https://api.minecraftservices.com/minecraft/profile/skins"
 
+# Public username-history sources, tried in order.
+MOJANG_NAME_HISTORY_URL = "https://api.mojang.com/user/profiles/{uuid}/names"
+LIFORRA_NAME_HISTORY_URL = "https://liforra.de/api/namehistory"
+ASHCON_PROFILE_URL = "https://api.ashcon.app/mojang/v2/user/{username}"
+
+LIVE_CONNECT_AUTHORIZE_URL = "https://login.live.com/oauth20_authorize.srf"
 LIVE_CONNECT_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
 LIVE_CONNECT_DESKTOP_REDIRECT_URI = "https://login.live.com/oauth20_desktop.srf"
 MINECRAFT_LAUNCHER_V1_CLIENT_ID = "00000000402b5328"
@@ -41,10 +51,21 @@ DEFAULT_USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+# Token / cookie shapes used to recognise pasted credentials.
+JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
+COOKIE_NAME_HINT = re.compile(
+    r"(?:^|[;\s])(uaid|MSPAuth|MSPPre|MSPCID|RPSSecAuth|WLSSC|OPARACHUTE|"
+    r"AADSSO|AMCSecAuth|__Host-|CkTst|PPAuth|MBI_SSL)=",
+    re.IGNORECASE,
+)
+
 # Valid skin variants
 SLIM = "slim"
 CLASSIC = "classic"
 ACTIVE_PROXY: str | None = None
+
+# Minecraft allows one username change per this window.
+NAME_CHANGE_COOLDOWN = timedelta(days=30)
 
 
 # --- Token acquisition ---
@@ -90,23 +111,26 @@ def choose_entry(entries: list[str], source: str, labels: list[str] | None = Non
 
 
 
-def choose_source(has_tokens: bool, has_refresh: bool) -> str:
-    """Choose the credential file when both are available."""
-    if has_tokens and not has_refresh:
-        return "token"
-    if has_refresh and not has_tokens:
-        return "refresh"
-
-    print("[*] Credential sources found:")
-    print("  [1] token.txt (cached Minecraft tokens)")
+def choose_source() -> str | None:
+    """Ask which credential source to use: token.txt, refresh.txt, or a paste."""
+    print("[*] Credential sources:")
+    print("  [1] token.txt   (cached Minecraft access tokens)")
     print("  [2] refresh.txt (Microsoft refresh tokens)")
+    print("  [3] Paste cookies, a refresh token, or an access token")
     while True:
-        choice = input("  Read from [1-2]: ").strip()
+        try:
+            choice = input("  Read from [1-3], q to cancel: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
         if choice == "1":
             return "token"
         if choice == "2":
             return "refresh"
-        print("  Please enter 1 or 2.")
+        if choice == "3":
+            return "paste"
+        if choice in ("q", "quit", "cancel", ""):
+            return None
+        print("  Please enter 1, 2, 3, or q.")
 
 
 async def get_token_labels(tokens: list[str]) -> list[str]:
@@ -127,11 +151,10 @@ async def get_token_labels(tokens: list[str]) -> list[str]:
         return await asyncio.gather(*(fetch_label(token) for token in tokens))
 
 
-async def get_mc_token_from_refresh(refresh_token: str) -> str | None:
-    """Turn a refresh token into a fresh MC token via full chain."""
+async def refresh_msa_token(refresh_token: str) -> str | None:
+    """Exchange a Microsoft refresh token for a fresh MSA access token."""
+    print("  [1/4] Refreshing MSA...")
     async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
-        # 1. Refresh MSA
-        print("  [1/4] Refreshing MSA...")
         resp = await client.post(
             LIVE_CONNECT_TOKEN_URL,
             data={
@@ -146,16 +169,26 @@ async def get_mc_token_from_refresh(refresh_token: str) -> str | None:
         if resp.status_code != 200:
             print(f"  [-] MSA refresh failed: {resp.status_code} {resp.text[:200]}")
             return None
-        msa = resp.json()["access_token"]
+        return resp.json().get("access_token")
 
+
+async def msa_to_mc_token(msa_token: str) -> str | None:
+    """Run an MSA access token through XBL -> XSTS -> Minecraft."""
+    # v1 Live-Connect opaque tokens (Ew...) need t=; v2 Azure AD JWTs need d=.
+    if msa_token.startswith("eyJ"):
+        rps_ticket = f"d={msa_token}"
+    elif msa_token.startswith(("t=", "d=")):
+        rps_ticket = msa_token
+    else:
+        rps_ticket = f"t={msa_token}"
+
+    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
         # 2. XBL
         print("  [2/4] Authenticating XBL...")
-        if not msa.startswith("t=") and not msa.startswith("d=") and not msa.startswith("eyJ"):
-            msa = f"t={msa}"
         resp = await client.post(
             XBL_AUTH_URL,
             json={
-                "Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com", "RpsTicket": msa},
+                "Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com", "RpsTicket": rps_ticket},
                 "RelyingParty": "http://auth.xboxlive.com",
                 "TokenType": "JWT",
             },
@@ -204,37 +237,278 @@ async def get_mc_token_from_refresh(refresh_token: str) -> str | None:
         return mc_token
 
 
+async def get_mc_token_from_refresh(refresh_token: str) -> str | None:
+    """Turn a refresh token into a fresh MC token via the full chain."""
+    msa_token = await refresh_msa_token(refresh_token)
+    if not msa_token:
+        return None
+    return await msa_to_mc_token(msa_token)
+
+
+# --- Pasted credential helpers ---
+
+def read_multiline_input(prompt: str) -> str:
+    """Read pasted text until an empty line so cookies can span multiple lines."""
+    print(prompt)
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip():
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def looks_like_cookies(text: str) -> bool:
+    """True when the pasted text is a cookie export / Cookie header, not tokens."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if any("\t" in line for line in lines):
+        return True
+    if any(line.lstrip("#").lower().startswith("httponly_") for line in lines):
+        return True
+    return bool(COOKIE_NAME_HINT.search(text))
+
+
+def parse_cookie_text(text: str) -> list[dict]:
+    """Parse Netscape .txt lines, a Cookie header, or name=value pairs."""
+    cookies: list[dict] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.lower().startswith("cookie:"):
+            line = line.split(":", 1)[1].strip()
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            domain, _flag, path, _secure, _expires, name, value = parts[:7]
+            if name:
+                cookies.append({"name": name, "value": value, "domain": domain, "path": path})
+            continue
+        for pair in line.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                name, value = pair.split("=", 1)
+                if name.strip():
+                    cookies.append({
+                        "name": name.strip(), "value": value.strip(),
+                        "domain": ".login.live.com", "path": "/",
+                    })
+    return cookies
+
+
+def build_cookie_header(cookies: list[dict]) -> str:
+    return "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in cookies)
+
+
+def make_pkce() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(64)[:128]
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def extract_code_from_location(location: str) -> str | None:
+    codes = parse_qs(urlparse(location).query).get("code", [])
+    return codes[0] if codes else None
+
+
+def decode_jwt_payload(token: str) -> dict | None:
+    """Decode a JWT payload without verifying its signature."""
+    try:
+        _header, payload, _signature = token.split(".")
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def looks_like_minecraft_jwt(token: str) -> bool:
+    claims = decode_jwt_payload(token)
+    return bool(claims) and (claims.get("token_type") == "Minecraft" or "xuid" in claims)
+
+
+async def get_msa_token_from_cookies(cookies: list[dict]) -> str | None:
+    """Exchange login.live.com session cookies for an MSA access token."""
+    verifier, challenge = make_pkce()
+    uaid = next((cookie["value"] for cookie in cookies if cookie["name"] == "uaid"), None)
+    params = {
+        "client_id": MINECRAFT_LAUNCHER_V1_CLIENT_ID,
+        "redirect_uri": LIVE_CONNECT_DESKTOP_REDIRECT_URI,
+        "response_type": "code",
+        "scope": LIVE_CONNECT_SCOPE_MBI_SSL,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "display": "touch",
+        "locale": "en",
+        "lw": "1",
+        "fl": "dob,easi2",
+        "xsup": "1",
+        "nopa": "2",
+    }
+    if uaid:
+        params["uaid"] = uaid
+
+    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
+        print("  [1/4] Authorizing with cookies...")
+        resp = await client.get(
+            f"{LIVE_CONNECT_AUTHORIZE_URL}?{urlencode(params)}",
+            headers={"Cookie": build_cookie_header(cookies), "User-Agent": DEFAULT_USER_AGENT},
+        )
+        if resp.status_code != 302:
+            print(f"  [-] Cookie authorize returned {resp.status_code} (expected 302)")
+            return None
+        code = extract_code_from_location(resp.headers.get("location", ""))
+        if not code:
+            print("  [-] No authorization code in the redirect")
+            return None
+        print("  [+] Got an authorization code, exchanging for a token...")
+        token_resp = await client.post(
+            LIVE_CONNECT_TOKEN_URL,
+            data={
+                "client_id": MINECRAFT_LAUNCHER_V1_CLIENT_ID,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": LIVE_CONNECT_DESKTOP_REDIRECT_URI,
+                "code_verifier": verifier,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": DEFAULT_USER_AGENT},
+        )
+        if token_resp.status_code != 200:
+            print(f"  [-] MSA token exchange returned {token_resp.status_code}")
+            return None
+        return token_resp.json().get("access_token")
+
+
+async def get_token_from_cookies(cookies: list[dict]) -> str | None:
+    """Exchange cookies for a Minecraft token, salvaging stored JWTs if needed."""
+    msa_token = await get_msa_token_from_cookies(cookies)
+    if msa_token:
+        return await msa_to_mc_token(msa_token)
+    for cookie in cookies:
+        match = JWT_RE.search(str(cookie.get("value", "")))
+        if match:
+            token = await credential_to_mc_token(match.group(0))
+            if token:
+                return token
+    return None
+
+
+async def credential_to_mc_token(credential: str) -> str | None:
+    """Turn a pasted access/refresh/MSA token into a Minecraft access token."""
+    credential = credential.strip()
+    if credential.lower().startswith("bearer "):
+        credential = credential[7:].strip()
+    if not credential:
+        return None
+    if looks_like_minecraft_jwt(credential):
+        print("  [+] Using the pasted Minecraft access token directly")
+        return credential
+    if credential.startswith("M."):
+        return await get_mc_token_from_refresh(credential)
+    if credential.startswith("Ew"):
+        # "Ew..." values are either MSA v1 refresh or access tokens; try both.
+        token = await get_mc_token_from_refresh(credential)
+        return token if token else await msa_to_mc_token(credential)
+    if credential.startswith("eyJ"):
+        return await msa_to_mc_token(credential)
+    return credential  # opaque/legacy token - try it as-is
+
+
+async def resolve_pasted_credentials(text: str) -> list[tuple[str, str]]:
+    """Detect pasted cookies / refresh / access tokens as (label, Minecraft token)."""
+    text = text.strip()
+    if not text:
+        return []
+    if looks_like_cookies(text):
+        cookies = parse_cookie_text(text)
+        if not cookies:
+            return []
+        print(f"[*] Parsed {len(cookies)} cookie(s); running the MSA -> XBL -> XSTS -> Minecraft chain...")
+        token = await get_token_from_cookies(cookies)
+        return [("cookies", token)] if token else []
+    tokens: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        label, credential = parse_refresh_entry(line)
+        if label.lower() in ("authorization", "bearer", "cookie"):
+            label = ""
+        print(f"[*] Resolving {label or 'pasted'} credential...")
+        token = await credential_to_mc_token(credential)
+        if token:
+            tokens.append((label, token))
+        else:
+            print(f"[!] Could not derive a Minecraft token from {label or 'the pasted credential'}")
+    return tokens
+
+
 async def resolve_token() -> str | None:
     """Select a credential source, then resolve it to a Minecraft token."""
     cwd = os.getcwd()
-    tokens = read_lines(os.path.join(cwd, "token.txt"))
-    refresh_lines = read_lines(os.path.join(cwd, "refresh.txt"))
+    while True:
+        source = choose_source()
+        if source is None:
+            return None
 
-    if not tokens and not refresh_lines:
-        print("[!] No token.txt or refresh.txt found. Run cookie_to_token.py first.")
-        return None
+        if source == "token":
+            tokens = read_lines(os.path.join(cwd, "token.txt"))
+            if not tokens:
+                print("[!] token.txt is missing or empty.")
+                continue
+            labels = await get_token_labels(tokens) if len(tokens) > 1 else None
+            token = choose_entry(tokens, "token.txt", labels)
+            async with httpx.AsyncClient(timeout=10, proxy=ACTIVE_PROXY) as client:
+                resp = await client.get(MC_PROFILE_URL, headers={"Authorization": f"Bearer {token}"})
+                if resp.status_code == 200:
+                    print("[*] Using cached MC token from token.txt")
+                    return token
+            print("[!] Selected MC token is invalid or expired. Choose another source.")
+            continue
 
-    source = choose_source(bool(tokens), bool(refresh_lines))
-    if source == "token":
-        labels = await get_token_labels(tokens) if len(tokens) > 1 else None
-        token = choose_entry(tokens, "token.txt", labels)
-        async with httpx.AsyncClient(timeout=10, proxy=ACTIVE_PROXY) as client:
-            resp = await client.get(MC_PROFILE_URL, headers={"Authorization": f"Bearer {token}"})
-            if resp.status_code == 200:
-                print("[*] Using cached MC token from token.txt")
+        if source == "refresh":
+            refresh_lines = read_lines(os.path.join(cwd, "refresh.txt"))
+            if not refresh_lines:
+                print("[!] refresh.txt is missing or empty.")
+                continue
+            refresh_labels = []
+            for entry in refresh_lines:
+                username, refresh_token = parse_refresh_entry(entry)
+                refresh_labels.append(username or mask_token(refresh_token))
+            selected_refresh = choose_entry(refresh_lines, "refresh.txt", refresh_labels)
+            username, refresh_token = parse_refresh_entry(selected_refresh)
+            label = f" for {username}" if username else ""
+            print(f"[*] Using refresh token{label} from refresh.txt")
+            token = await get_mc_token_from_refresh(refresh_token)
+            if token:
                 return token
-        print("[!] Selected MC token is invalid or expired.")
-        return None
+            print("[!] That refresh token did not reach a Minecraft account. Choose another source.")
+            continue
 
-    refresh_labels = []
-    for entry in refresh_lines:
-        username, refresh_token = parse_refresh_entry(entry)
-        refresh_labels.append(username or mask_token(refresh_token))
-    selected_refresh = choose_entry(refresh_lines, "refresh.txt", refresh_labels)
-    username, refresh_token = parse_refresh_entry(selected_refresh)
-    label = f" for {username}" if username else ""
-    print(f"[*] Using refresh token{label} from refresh.txt")
-    return await get_mc_token_from_refresh(refresh_token)
+        # Pasted cookies, refresh token, or access token.
+        text = read_multiline_input(
+            "Paste cookies, a refresh token, or an access token "
+            "(a 'username:token' label is fine); finish with an empty line:"
+        )
+        if not text.strip():
+            print("[!] Nothing was pasted.")
+            continue
+        candidates = await resolve_pasted_credentials(text)
+        if not candidates:
+            print("[!] Could not derive a Minecraft access token from that input. Choose another source.")
+            continue
+        if len(candidates) > 1:
+            labels = [label or mask_token(token) for label, token in candidates]
+            return choose_entry([token for _label, token in candidates], "pasted credentials", labels)
+        return candidates[0][1]
+
 
 # --- Name operations ---
 
@@ -359,6 +633,113 @@ async def reset_skin(token: str) -> bool:
         return False
 
 
+# --- Username (name change) history ---
+
+def ordinal(number: int) -> str:
+    if 10 < number % 100 < 14:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+    return f"{number}{suffix}"
+
+
+def format_datetime(value: datetime) -> str:
+    local = value.astimezone()
+    hour = local.hour % 12 or 12
+    timezone_name = local.tzname() or "local time"
+    return (
+        f"{local.strftime('%B')} {ordinal(local.day)} {local.year}, "
+        f"{hour}:{local.strftime('%M:%S %p')} {timezone_name}"
+    )
+
+
+def parse_timestamp(value) -> datetime | None:
+    """Accept ISO strings, epoch milliseconds, or epoch seconds."""
+    if isinstance(value, (int, float)):
+        # 1e11 seconds is year 5138, so smaller values are seconds, not ms.
+        millis = value if abs(value) >= 1e11 else value * 1000
+        try:
+            return datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return parse_timestamp(int(text))
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def history_entry_name(entry: dict) -> str | None:
+    for key in ("name", "username"):
+        if isinstance(entry.get(key), str) and entry[key]:
+            return entry[key]
+    return None
+
+
+def history_entry_timestamp(entry: dict) -> datetime | None:
+    for key in ("changed_at", "changedToAt", "changedAt"):
+        if key in entry:
+            timestamp = parse_timestamp(entry[key])
+            if timestamp:
+                return timestamp
+    return None
+
+
+async def get_name_history(client: httpx.AsyncClient, uuid: str, username: str) -> tuple[str, list[dict]]:
+    """Try Mojang first, then public username-history archives."""
+    try:
+        resp = await client.get(MOJANG_NAME_HISTORY_URL.format(uuid=uuid.replace("-", "")))
+        if resp.status_code == 200:
+            history = resp.json()
+            if isinstance(history, list) and all(isinstance(item, dict) for item in history):
+                return "Mojang API", history
+    except (httpx.HTTPError, ValueError):
+        pass
+
+    try:
+        resp = await client.get(LIFORRA_NAME_HISTORY_URL, params={"username": username}, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            history = data.get("history") if isinstance(data, dict) else None
+            if isinstance(history, list) and all(isinstance(item, dict) for item in history):
+                return "Liforra public archive", history
+    except (httpx.HTTPError, ValueError):
+        pass
+
+    try:
+        resp = await client.get(ASHCON_PROFILE_URL.format(username=username), timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            history = data.get("username_history") if isinstance(data, dict) else None
+            if isinstance(history, list) and all(isinstance(item, dict) for item in history):
+                return "Ashcon public archive", history
+    except (httpx.HTTPError, ValueError):
+        pass
+
+    return "Unavailable", []
+
+
+def print_name_history(source: str, history: list[dict], current_name: str) -> None:
+    print("\n  Username history")
+    if not history:
+        print("    Status:           unavailable")
+        return
+    print(f"    Source:           {source}")
+    print(f"    Entries:          {len(history)}")
+    for entry in history:
+        name = history_entry_name(entry) or "Unknown"
+        suffix = " (current)" if name.casefold() == current_name.casefold() else ""
+        timestamp = history_entry_timestamp(entry)
+        detail = format_datetime(timestamp) if timestamp else "original name / no date"
+        print(f"    - {name}{suffix} - {detail}")
+
+
 # --- Main menu ---
 
 async def main():
@@ -394,16 +775,36 @@ async def main():
         else:
             print(f"  Active skin:     default (Steve/Alex)")
 
-        # Check name change eligibility
+        # Check name change eligibility, timing, and history
         nc_resp = await client.get(
             MC_NAME_CHANGE_URL,
             headers={"Authorization": f"Bearer {token}"},
         )
         name_change_allowed = False
         if nc_resp.status_code == 200:
-            nc = nc_resp.json()
-            name_change_allowed = nc.get("nameChangeAllowed", False)
-            print(f"  Name change:     {'ALLOWED' if name_change_allowed else 'ON COOLDOWN'}")
+            nc = nc_resp.json() if isinstance(nc_resp.json(), dict) else {}
+            name_change_allowed = bool(nc.get("nameChangeAllowed", False))
+            created_at = parse_timestamp(nc.get("createdAt"))
+            changed_at = parse_timestamp(nc.get("changedAt"))
+            if created_at:
+                print(f"  Account created: {format_datetime(created_at)}")
+            if changed_at:
+                print(f"  Last changed:    {format_datetime(changed_at)}")
+            if name_change_allowed:
+                print("  Name change:     ALLOWED")
+            else:
+                next_allowed = changed_at + NAME_CHANGE_COOLDOWN if changed_at else None
+                now = datetime.now(timezone.utc)
+                if next_allowed and next_allowed > now:
+                    remaining = next_allowed - now
+                    print(f"  Name change:     ON COOLDOWN until "
+                          f"{format_datetime(next_allowed)} (about {remaining.days} days)")
+                else:
+                    print("  Name change:     ON COOLDOWN")
+
+        if uuid_ and uuid_ != "?":
+            history_source, history = await get_name_history(client, uuid_, name)
+            print_name_history(history_source, history, name)
 
     # Show options
     print(f"\n{'─'*55}")
