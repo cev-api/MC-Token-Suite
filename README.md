@@ -84,13 +84,30 @@ python refresh_to_token.py
 
 The script uses each refresh token to get a new Minecraft access token.
 
-It adds working access tokens to `token.txt`.
+It writes the successful access tokens to `token.txt`. They are staged in
+`token.txt.part` while the run is going, so a run where nothing succeeds leaves
+the previous `token.txt` alone.
 
 It writes rotated refresh tokens to a file such as:
 
 ```text
 rotated_refresh_2026-09-11_12-00-00.txt
 ```
+
+### Options
+
+```powershell
+python refresh_to_token.py --limit 10          # try 10 tokens first
+python refresh_to_token.py --concurrency 8     # fewer tokens at once
+python refresh_to_token.py --refresh validated_refresh_2026-09-12_20-40-04.txt
+python refresh_to_token.py --proxies proxy.txt
+python refresh_to_token.py --no-proxies        # ignore proxy.txt
+python refresh_to_token.py --dir C:\path\to\folder
+```
+
+Keep `--concurrency` at or below the default (16) when the proxy list is free
+proxies. The chain makes four requests per token, and pushing more at once is
+what makes the proxies slow enough to time out.
 
 ## Check your tokens
 

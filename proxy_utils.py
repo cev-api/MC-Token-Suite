@@ -10,6 +10,69 @@ import httpx
 
 PROXY_FAILURE_RETRIES = 3
 
+# Networking defaults. A dead proxy has to fail fast: with a long connect
+# timeout, one unreachable endpoint burns the whole per-token budget before
+# failover even starts.
+HTTP_CONNECT_TIMEOUT = 6.0
+HTTP_READ_TIMEOUT = 12.0
+
+
+def http_timeout(read: float = HTTP_READ_TIMEOUT) -> httpx.Timeout:
+    """Timeout with a short connect phase so dead proxies fail quickly."""
+    return httpx.Timeout(read, connect=HTTP_CONNECT_TIMEOUT)
+
+
+class ClientCache:
+    """One long-lived HTTP client per proxy, reused for the whole run.
+
+    A client per request (the old behaviour of refresh_to_token.py) forces a
+    fresh TCP + TLS handshake through the proxy for every step of every token.
+    That is what turns a 9-second chain into a 45-second one as soon as a few
+    workers run at once, and then the chain budget expires and the proxy gets
+    the blame.
+    """
+
+    def __init__(self, max_connections: int = 4):
+        self._max_connections = max_connections
+        self._clients: dict[str, httpx.AsyncClient] = {}
+
+    def get(self, proxy: str | None) -> httpx.AsyncClient:
+        key = proxy or ""
+        client = self._clients.get(key)
+        if client is None:
+            client = httpx.AsyncClient(
+                timeout=http_timeout(),
+                proxy=proxy,
+                follow_redirects=False,
+                limits=httpx.Limits(
+                    max_connections=self._max_connections,
+                    max_keepalive_connections=self._max_connections,
+                ),
+            )
+            self._clients[key] = client
+        return client
+
+    async def aclose(self) -> None:
+        for client in self._clients.values():
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+        self._clients.clear()
+
+
+CLIENTS = ClientCache()
+
+
+def client_for(proxy: str | None) -> httpx.AsyncClient:
+    """Shared client for this proxy; connections are pooled and reused."""
+    return CLIENTS.get(proxy)
+
+
+async def close_clients() -> None:
+    """Close every pooled client. Call once, at the end of a run."""
+    await CLIENTS.aclose()
+
 
 def read_proxy_file(path: Path) -> list[str]:
     proxies = []
@@ -47,50 +110,75 @@ class ProxyPool:
         self.failed: set[str] = set()
         self.claimed: set[str] = set()
 
-    def candidates(self, index: int) -> list[str | None]:
-        if not self.proxies:
-            return [None]
-        candidates = []
-        for offset in range(len(self.proxies)):
-            proxy = self.proxies[(index + offset) % len(self.proxies)]
-            if proxy in self.failed:
-                continue
-            candidates.append(proxy)
-            if len(candidates) == self.max_attempts:
-                break
-        return candidates or [None]
-
     def mark_failed(self, proxy: str | None) -> None:
         if proxy:
             self.failed.add(proxy)
 
     def candidate_for_attempt(self, index: int, attempt: int) -> str | None:
-        """Claim an unused proxy for this attempt; never reuse one in a run."""
+        """Claim a healthy proxy for this attempt.
+
+        Endpoints already proven dead in this run are skipped, and a proxy
+        claimed by another attempt is not handed out twice. When everything is
+        claimed or dead the pool cycles back to the least-bad option rather than
+        returning None: a silent direct connection would leak the real IP.
+        """
         if not self.proxies:
             return None
         start = (index + attempt) % len(self.proxies)
         for offset in range(len(self.proxies)):
             proxy = self.proxies[(start + offset) % len(self.proxies)]
-            if proxy not in self.claimed:
+            if proxy not in self.claimed and proxy not in self.failed:
                 self.claimed.add(proxy)
                 return proxy
-        return None
+        # Every endpoint is claimed; free the round and try the healthy ones.
+        self.claimed.clear()
+        for offset in range(len(self.proxies)):
+            proxy = self.proxies[(start + offset) % len(self.proxies)]
+            if proxy not in self.failed:
+                self.claimed.add(proxy)
+                return proxy
+        # Every endpoint has failed at least once. Start a fresh cycle with the
+        # proxy that failed longest ago instead of connecting directly.
+        self.failed.clear()
+        proxy = self.proxies[start % len(self.proxies)]
+        self.claimed.add(proxy)
+        return proxy
 
     async def run(self, index: int, operation):
-        """Run an async operation again through another proxy on transport failure."""
+        """Run an async operation, retrying transport failures on another proxy.
+
+        Only a transport failure blames the proxy. A chain that overruns its own
+        budget raises asyncio.TimeoutError - that is retried on another proxy
+        but does not quarantine the endpoint, because the proxy usually still
+        works and the request was merely slow. Blaming it was what made a run
+        under load report "every proxy failed" while the same proxies were
+        perfectly usable one request at a time.
+        """
         last_error = None
         for attempt in range(self.max_attempts):
             proxy = self.candidate_for_attempt(index, attempt)
             try:
                 return await operation(proxy)
-            except (httpx.TransportError, asyncio.TimeoutError) as exc:
+            except httpx.TransportError as exc:
                 self.mark_failed(proxy)
                 last_error = exc
-                if proxy and attempt + 1 < self.max_attempts:
-                    print(f"[*] Proxy {proxy_label(proxy)} failed; retrying with another proxy...")
+                if attempt + 1 < self.max_attempts:
+                    print(
+                        f"[*] Proxy {proxy_label(proxy)} failed "
+                        f"({type(exc).__name__}); retrying with another proxy...",
+                        flush=True,
+                    )
+            except asyncio.TimeoutError as exc:
+                last_error = exc
+                if attempt + 1 < self.max_attempts:
+                    print(
+                        f"[*] Attempt through {proxy_label(proxy)} ran out of time; "
+                        f"retrying with another proxy...",
+                        flush=True,
+                    )
         if last_error:
             raise last_error
-        return await operation(None)
+        return None
 
 def choose_proxies(directory: str = ".") -> list[str]:
     """Use proxy.txt/proxies.txt when either file exists.

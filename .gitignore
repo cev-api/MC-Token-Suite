@@ -3,6 +3,7 @@
 *.rar
 *.zip
 *.csv
+*.part
 !requirements.txt
 
 # Python
