@@ -11,6 +11,7 @@ token, or access token, and allows:
 
 import os
 import sys
+import time
 import asyncio
 import base64
 import json
@@ -21,7 +22,13 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
-from proxy_utils import choose_proxies
+from proxy_utils import (
+    ProxyRotator,
+    choose_proxies,
+    http_timeout,
+    probe_proxy,
+    proxy_label,
+)
 
 # --- Constants ---
 
@@ -62,10 +69,100 @@ COOKIE_NAME_HINT = re.compile(
 # Valid skin variants
 SLIM = "slim"
 CLASSIC = "classic"
-ACTIVE_PROXY: str | None = None
+
+# Proxy settings. A large free proxy list is mostly dead endpoints, so every
+# request must be able to move on to the next one instead of aborting the run.
+PROXY_ATTEMPTS = 6
+PROXY_CHECK_TIMEOUT = 5.0
+PROXY_DISCOVERY_BATCH = 40
+PROXY_DISCOVERY_TARGET = 5
+PROXY_DISCOVERY_BUDGET = 45.0
+
+ROTATOR = ProxyRotator([])
+
+# Raised before a request can have reached the server, so a retry through
+# another proxy cannot repeat a name or skin change.
+RETRYABLE_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError)
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 # Minecraft allows one username change per this window.
 NAME_CHANGE_COOLDOWN = timedelta(days=30)
+
+
+class ProxyFailoverClient:
+    """AsyncClient stand-in that retries a request through the next proxy.
+
+    Every request used to be pinned to proxies[0]. When that endpoint was
+    unreachable the whole program died on an uncaught ConnectTimeout.
+    """
+
+    def __init__(self, timeout: float = 15.0, attempts: int = PROXY_ATTEMPTS):
+        self._timeout = timeout
+        self._attempts = max(1, attempts)
+        self._clients: dict[str, httpx.AsyncClient] = {}
+        self._preferred: str | None = None
+
+    async def __aenter__(self) -> "ProxyFailoverClient":
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        for client in self._clients.values():
+            await client.aclose()
+        self._clients.clear()
+
+    def _client_for(self, proxy: str | None) -> httpx.AsyncClient:
+        key = proxy or ""
+        client = self._clients.get(key)
+        if client is None:
+            client = httpx.AsyncClient(timeout=http_timeout(self._timeout), proxy=proxy)
+            self._clients[key] = client
+        return client
+
+    def _pick_proxy(self) -> str | None:
+        # Stay on the last working proxy so connections are reused, and only
+        # rotate once it starts failing or gets quarantined.
+        if self._preferred and self._preferred not in ROTATOR.quarantined:
+            return self._preferred
+        return ROTATOR.next()
+
+    def _attempt_count(self) -> int:
+        configured = len(ROTATOR.proxies)
+        return max(1, min(self._attempts, configured if configured > 1 else 3))
+
+    async def request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        last_error: httpx.HTTPError | None = None
+        for _ in range(self._attempt_count()):
+            proxy = self._pick_proxy()
+            try:
+                response = await self._client_for(proxy).request(method, url, **kwargs)
+            except RETRYABLE_CONNECT_ERRORS as exc:
+                last_error = exc
+                ROTATOR.mark_failed(proxy)
+                self._preferred = None
+                print(f"    [!] {proxy_label(proxy)}: {type(exc).__name__}; trying the next proxy")
+                continue
+            except httpx.TransportError as exc:
+                ROTATOR.mark_failed(proxy)
+                self._preferred = None
+                if method.upper() not in SAFE_METHODS:
+                    raise
+                last_error = exc
+                continue
+            ROTATOR.mark_ok(proxy)
+            self._preferred = proxy
+            return response
+        if last_error is None:
+            raise httpx.ConnectError(f"No proxy could reach {url}")
+        raise last_error
+
+    async def get(self, url: str, **kwargs) -> httpx.Response:
+        return await self.request("GET", url, **kwargs)
+
+    async def post(self, url: str, **kwargs) -> httpx.Response:
+        return await self.request("POST", url, **kwargs)
+
+    async def delete(self, url: str, **kwargs) -> httpx.Response:
+        return await self.request("DELETE", url, **kwargs)
 
 
 # --- Token acquisition ---
@@ -135,7 +232,7 @@ def choose_source() -> str | None:
 
 async def get_token_labels(tokens: list[str]) -> list[str]:
     """Fetch Minecraft names for cached tokens, marking invalid entries."""
-    async with httpx.AsyncClient(timeout=10, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(10) as client:
         async def fetch_label(token: str) -> str:
             try:
                 resp = await client.get(
@@ -154,7 +251,7 @@ async def get_token_labels(tokens: list[str]) -> list[str]:
 async def refresh_msa_token(refresh_token: str) -> str | None:
     """Exchange a Microsoft refresh token for a fresh MSA access token."""
     print("  [1/4] Refreshing MSA...")
-    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(30) as client:
         resp = await client.post(
             LIVE_CONNECT_TOKEN_URL,
             data={
@@ -182,7 +279,7 @@ async def msa_to_mc_token(msa_token: str) -> str | None:
     else:
         rps_ticket = f"t={msa_token}"
 
-    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(30) as client:
         # 2. XBL
         print("  [2/4] Authenticating XBL...")
         resp = await client.post(
@@ -355,7 +452,7 @@ async def get_msa_token_from_cookies(cookies: list[dict]) -> str | None:
     if uaid:
         params["uaid"] = uaid
 
-    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(30) as client:
         print("  [1/4] Authorizing with cookies...")
         resp = await client.get(
             f"{LIVE_CONNECT_AUTHORIZE_URL}?{urlencode(params)}",
@@ -465,7 +562,7 @@ async def resolve_token() -> str | None:
                 continue
             labels = await get_token_labels(tokens) if len(tokens) > 1 else None
             token = choose_entry(tokens, "token.txt", labels)
-            async with httpx.AsyncClient(timeout=10, proxy=ACTIVE_PROXY) as client:
+            async with ProxyFailoverClient(10) as client:
                 resp = await client.get(MC_PROFILE_URL, headers={"Authorization": f"Bearer {token}"})
                 if resp.status_code == 200:
                     print("[*] Using cached MC token from token.txt")
@@ -515,7 +612,7 @@ async def resolve_token() -> str | None:
 async def check_name_available(token: str, name: str) -> bool:
     """Check if a Minecraft username is available."""
     url = MC_NAME_AVAIL_URL.replace("{name}", name)
-    async with httpx.AsyncClient(timeout=15, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(15) as client:
         resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code == 200:
             data = resp.json()
@@ -525,7 +622,7 @@ async def check_name_available(token: str, name: str) -> bool:
 
 async def change_name(token: str, new_name: str) -> bool:
     """Change the Minecraft username."""
-    async with httpx.AsyncClient(timeout=15, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(15) as client:
         resp = await client.post(
             MC_NAME_CHANGE_URL,
             json={"name": new_name},
@@ -556,7 +653,7 @@ async def change_skin_from_url(token: str, skin_url: str, variant: str = CLASSIC
         print(f"    Invalid variant: {variant} (use 'classic' or 'slim')")
         return False
 
-    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(30) as client:
         # Download the skin first to check it's valid
         print(f"    Downloading skin from URL...")
         img_resp = await client.get(skin_url)
@@ -603,7 +700,7 @@ async def change_skin_from_file(token: str, filepath: str, variant: str = CLASSI
 
     print(f"    Read {len(skin_data)} bytes from {filepath}")
 
-    async with httpx.AsyncClient(timeout=30, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(30) as client:
         resp = await client.post(
             MC_SKIN_URL,
             headers={"Authorization": f"Bearer {token}"},
@@ -621,7 +718,7 @@ async def change_skin_from_file(token: str, filepath: str, variant: str = CLASSI
 
 async def reset_skin(token: str) -> bool:
     """Reset skin to default (Steve/Alex)."""
-    async with httpx.AsyncClient(timeout=15, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(15) as client:
         resp = await client.delete(
             MC_SKIN_URL,
             headers={"Authorization": f"Bearer {token}"},
@@ -675,6 +772,70 @@ def parse_timestamp(value) -> datetime | None:
     return None
 
 
+def format_duration(delta: timedelta) -> str:
+    seconds = int(max(delta.total_seconds(), 0))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    if days:
+        return f"{days} day{'s' if days != 1 else ''}"
+    if hours:
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    if minutes:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return "less than a minute"
+
+
+def decode_jwt_claims(token: str) -> dict | None:
+    """Return the JWT payload, or None for opaque or malformed tokens."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1]
+    try:
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        claims = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def print_token_details(token: str) -> None:
+    """Decode the Minecraft JWT so a rejected token still identifies its account."""
+    claims = decode_jwt_claims(token)
+    if not claims:
+        return
+
+    username = None
+    profile_fields = claims.get("pfd")
+    if isinstance(profile_fields, list):
+        for entry in profile_fields:
+            if isinstance(entry, dict) and entry.get("type") == "mc" and isinstance(entry.get("name"), str):
+                username = entry["name"]
+                break
+
+    profiles = claims.get("profiles")
+    uuid_ = profiles.get("mc") if isinstance(profiles, dict) else None
+    if not isinstance(uuid_, str):
+        uuid_ = None
+
+    expires_at = parse_timestamp(claims.get("exp"))
+
+    print("\n  Token details (decoded from the JWT)")
+    print(f"    Username:        {username or 'unknown'}")
+    print(f"    UUID:            {uuid_ or 'unknown'}")
+    if expires_at:
+        detail = format_datetime(expires_at)
+        now = datetime.now(timezone.utc)
+        if expires_at <= now:
+            detail += f" - EXPIRED {format_duration(now - expires_at)} ago"
+        else:
+            detail += f" - valid for {format_duration(expires_at - now)}"
+        print(f"    Expires:         {detail}")
+    else:
+        print("    Expires:         unknown")
+
+
 def history_entry_name(entry: dict) -> str | None:
     for key in ("name", "username"):
         if isinstance(entry.get(key), str) and entry[key]:
@@ -691,7 +852,7 @@ def history_entry_timestamp(entry: dict) -> datetime | None:
     return None
 
 
-async def get_name_history(client: httpx.AsyncClient, uuid: str, username: str) -> tuple[str, list[dict]]:
+async def get_name_history(client: ProxyFailoverClient, uuid: str, username: str) -> tuple[str, list[dict]]:
     """Try Mojang first, then public username-history archives."""
     try:
         resp = await client.get(MOJANG_NAME_HISTORY_URL.format(uuid=uuid.replace("-", "")))
@@ -742,10 +903,50 @@ def print_name_history(source: str, history: list[dict], current_name: str) -> N
 
 # --- Main menu ---
 
+async def select_live_proxies(proxies: list[str]) -> list[str]:
+    """Find working endpoints instead of trusting the first entry in the file.
+
+    Probing stops as soon as enough proxies answer, so a healthy list costs one
+    short round rather than a full scan of hundreds of dead entries.
+    """
+    if len(proxies) < 2:
+        return proxies
+
+    print(f"[*] Looking for working proxies among {len(proxies)} entries...", flush=True)
+    alive: list[str] = []
+    checked = 0
+    deadline = time.monotonic() + PROXY_DISCOVERY_BUDGET
+
+    async def probe(proxy: str) -> bool:
+        try:
+            return await asyncio.wait_for(
+                probe_proxy(proxy, timeout=PROXY_CHECK_TIMEOUT),
+                PROXY_CHECK_TIMEOUT + 1,
+            )
+        except asyncio.TimeoutError:
+            return False
+
+    for start in range(0, len(proxies), PROXY_DISCOVERY_BATCH):
+        if len(alive) >= PROXY_DISCOVERY_TARGET or time.monotonic() >= deadline:
+            break
+        batch = proxies[start:start + PROXY_DISCOVERY_BATCH]
+        results = await asyncio.gather(*(probe(proxy) for proxy in batch))
+        checked += len(batch)
+        alive.extend(proxy for proxy, ok in zip(batch, results) if ok)
+        print(f"    {checked}/{len(proxies)} checked, {len(alive)} working", flush=True)
+
+    if not alive:
+        print("[!] No proxy answered the health check; using the full list with per-request failover.")
+        return proxies
+    print(f"[*] Using {len(alive)} working proxy/proxies (checked {checked}).")
+    return alive
+
+
 async def main():
-    global ACTIVE_PROXY
+    global ROTATOR
     proxies = choose_proxies(os.getcwd())
-    ACTIVE_PROXY = proxies[0] if proxies else None
+    proxies = await select_live_proxies(proxies)
+    ROTATOR = ProxyRotator(proxies, quarantine_after=2)
     print("=" * 55)
     print("  Minecraft Account Manager")
     print("=" * 55)
@@ -754,8 +955,10 @@ async def main():
     if not token:
         sys.exit(1)
 
+    print_token_details(token)
+
     # Show current profile
-    async with httpx.AsyncClient(timeout=15, proxy=ACTIVE_PROXY) as client:
+    async with ProxyFailoverClient(15) as client:
         resp = await client.get(MC_PROFILE_URL, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code != 200:
             print("[!] Token rejected by Minecraft API.")
@@ -887,4 +1090,12 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except httpx.HTTPError as exc:
+        print(f"\n[!] Network error: {type(exc).__name__}: {exc}")
+        print("[!] No proxy could reach the Minecraft API. Check the proxy list and try again.")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n  Cancelled.")
+        sys.exit(130)
